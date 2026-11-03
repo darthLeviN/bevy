@@ -332,6 +332,8 @@ pub async fn initialize_renderer(
         limits = adapter.limits();
     }
 
+    features |= options.supported_optional_features(adapter.features());
+
     // Enforce the disabled features
     if let Some(disabled_features) = options.disabled_features {
         features.remove(disabled_features);

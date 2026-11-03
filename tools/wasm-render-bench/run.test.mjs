@@ -1,11 +1,16 @@
 import { test, expect } from 'bun:test';
-import { browserOptions, run, validateResult } from './run.mjs';
+import { browserOptions, formatSummary, run, validateResult } from './run.mjs';
 import { staticHandler } from '../wasm-ecs-bench/run.mjs';
 import { fileURLToPath } from 'node:url';
 import { htmlDefaults, pageConfiguration } from './options.mjs';
 
 const requested = (mode, workers = mode === 'serial' ? 0 : 4, movingMeshes = 1) => ({ mode, workers, movingMeshes });
 const result = (mode, workers = mode === 'serial' ? 0 : 4, movingMeshes = 1, cpuWork = 0) => ({ mode, fps: 100, frames: 500, measurement_ms: 5000, warmup_ms: 5000,
+  cpu_timing_scope: 'per-schedule active wall spans',
+  schedule_timings: ['main:Update', 'main:PostUpdate', 'render:Render', 'render:extract_callback'].map(schedule =>
+    ({ schedule, calls: 499, mean_ms: 1, p50_ms: 0.8, p95_ms: 2 })),
+  gpu_timing: { supported: false, samples: 0, mean_ms: null, p50_ms: null, p95_ms: null,
+    reason: 'Bevy 0.20.1 does not support WebGPU GPU timestamps' },
   cpu_work: cpuWork, cpu_systems: cpuWork > 0 ? 32 : 0, cpu_verified: true,
   compute_workers: workers, cameras: 1, meshes: movingMeshes + 1, moving_meshes: movingMeshes,
     unique_materials: movingMeshes + 1, motion_verified: true, unlit: true,
@@ -82,6 +87,32 @@ test('accepts exactly the requested scene and timing contracts', () => {
   }
 });
 
+test('timing validation rejects stale artifacts, invalid aggregates and asynchronous GPU proxies', () => {
+  const valid = result('serial');
+  for (const patch of [
+    { schedule_timings: 'invalid' },
+    ...[{ calls: 0 }, { mean_ms: NaN }, { p50_ms: -1 }, { p95_ms: 0 }].map(bad =>
+      ({ schedule_timings: valid.schedule_timings.map(row => ({ ...row, ...bad })) })),
+    { gpu_timing: undefined },
+    ...[{ supported: true }, { mean_ms: 10 }, { samples: 1 }, { reason: '' }].map(bad =>
+      ({ gpu_timing: { ...valid.gpu_timing, ...bad } })),
+  ]) expect(() => validateResult({ ...valid, ...patch }, requested('serial'))).toThrow();
+});
+
+test('timestamp samples require real source, disjoint scope and exact window coverage', () => {
+  const value = result('serial');
+  value.gpu_timing = { supported: true, source: 'timestamp-query', scope: 'sum_disjoint_instrumented_passes',
+    samples: 499, expected_samples: 500, missing_samples: 1, mean_ms: 0.7, p50_ms: 0.6, p95_ms: 1 };
+  expect(validateResult(value, requested('serial'))).toBe(value);
+  for (const bad of [{ source: 'frame-time' }, { scope: 'sum_nested_spans' }, { samples: 501 },
+    { expected_samples: 499 }, { missing_samples: 0 }, { mean_ms: NaN }, { p95_ms: 0 }]) {
+    expect(() => validateResult({ ...value, gpu_timing: { ...value.gpu_timing, ...bad } }, requested('serial'))).toThrow();
+  }
+  const summary = formatSummary({ configuration: { movingMeshes: 1, cpuWork: 0 }, results: [{ ...value, requested_workers: 0 }] });
+  expect(summary).toContain('GPU ms/frame');
+  expect(summary).toContain('0.70');
+});
+
 test('heavy results must report the exact work and all 32 verified systems', () => {
   const expected = { ...requested('threaded'), cpuWork: 13 };
   const value = result('threaded', 4, 1, 13);
@@ -130,13 +161,15 @@ function fixture(fail = false, closeFailure = false) {
   const events = [], saved = [], creations = [];
   let options;
   const dependencies = {
+    prepareProfile: async () => '/fake/profile.json',
+    readProfile: async () => ({}),
     loadDefaults: async () => ({ movingMeshes: 1, workers: 4 }),
     serve: () => ({port: 1234, stop: async () => { events.push('server-close'); }}),
     createBrowser: received => {
       options = received;
       const id = creations.length + 1;
       const mode = received.variants[0];
-      let params;
+      let params, collection = 0;
       creations.push(received);
       events.push('browser-create:' + mode);
       return {log: 'fake driver ' + id, close: async () => {
@@ -148,7 +181,10 @@ function fixture(fail = false, closeFailure = false) {
             await visit(mode, {session: 'session-' + id, created: { capabilities: { 'moz:processID': 100 + id } }, request: async (method, path, body) => {
               if (path.endsWith('/url')) { events.push(body.url); params = new URL(body.url).searchParams; }
               if (path.endsWith('/execute/async')) {
+                if (body.script.includes('Services.profiler.')) return {value: {interval: body.args[0]?.interval}};
                 if (fail === true || fail === mode) throw Error('renderer failed');
+                if (collection++ === 0) return {captureRequest: '1'};
+                if (collection === 2) return {cpuEnd: true};
                 return {result: result(mode, Number(params.get('workers')), Number(params.get('meshes')), Number(params.get('cpu-work'))), console: [], width: 1280, height: 720, dpr: 1, isolated: true};
               }
             }});
@@ -165,8 +201,8 @@ test('each case gets a fresh browser closed before the next starts', async () =>
   const report = await run(fake.dependencies);
   expect(report.results.map(row => row.measuredFPS)).toEqual([100, 100]);
   expect(fake.events).toEqual([
-    'browser-create:threaded', 'http://127.0.0.1:1234/?mode=threaded&workers=4&meshes=1&cpu-work=0', 'browser-close:threaded',
-    'browser-create:serial', 'http://127.0.0.1:1234/?mode=serial&workers=0&meshes=1&cpu-work=0', 'browser-close:serial', 'server-close',
+    'browser-create:threaded', 'http://127.0.0.1:1234/?mode=threaded&workers=4&meshes=1&cpu-work=0&profile-controlled=1', 'browser-close:threaded',
+    'browser-create:serial', 'http://127.0.0.1:1234/?mode=serial&workers=0&meshes=1&cpu-work=0&profile-controlled=1', 'browser-close:serial', 'server-close',
   ]);
   expect(fake.creations.map(options => options.variants)).toEqual([['threaded'], ['serial']]);
   expect(report.results.map(row => row.browser_session_id)).toEqual(['session-1', 'session-2']);
@@ -179,6 +215,97 @@ test('each case gets a fresh browser closed before the next starts', async () =>
   expect(fake.options.env).toBe(process.env);
   expect(fake.saved[0].status).toBe('ok');
   expect(browserOptions.variants).toEqual(['threaded', 'serial']);
+});
+
+test('CPU profile is read after owned shutdown and missing CPU remains explicitly unavailable', async () => {
+  const fake = fixture();
+  let reads = 0;
+  const report = await run({ ...fake.dependencies, readProfile: async path => {
+    expect(path).toBe('/fake/profile.json');
+    expect(fake.events.at(-1)).toMatch(/^browser-close:/);
+    reads++;
+    return {};
+  } });
+  expect(reads).toBe(2);
+  expect(report.profiling.enabled).toBe(true);
+  expect(fake.creations.every(options => options.profileControlled === true)).toBe(true);
+  for (const row of report.results) {
+    expect(row.cpu_execution.supported).toBe(false);
+    expect(row.cpu_execution.total_cpu_ms_per_update).toBeUndefined();
+    expect(row.cpu_execution.reason).toContain('content-process CPU window');
+    expect(row.browser_thread_cpu.supported).toBe(false);
+    expect(row.browser_thread_cpu.reason).toContain('content-process CPU window');
+  }
+});
+
+test('default runner automatically prints sampled app CPU for both cases from captured profiles', async () => {
+  const fake = fixture();
+  const logs = [];
+  let capture = 0;
+  const report = await run({ ...fake.dependencies, movingMeshes: 100, workers: [8, 0], cpuWork: 1,
+    log: message => logs.push(message),
+    readProfile: async () => {
+      const workers = capture++ === 0 ? 8 : 0;
+      const threads = Array.from({ length: workers + 1 }, (_, index) => ({
+        name: index ? 'DOM Worker' : 'GeckoMain', processType: 'tab', pid: 42, tid: index + 1,
+        markers: { schema: { data: 0, startTime: 1 }, data: index ? [] : [
+          [{ name: 'benchmark-cpu-start' }, 10], [{ name: 'benchmark-cpu-end' }, 5010],
+        ] },
+        stringTable: ['wasm-function[123]'],
+        frameTable: { schema: { location: 0 }, data: [[0]] },
+        stackTable: { schema: { prefix: 0, frame: 1 }, data: [[null, 0]] },
+        samples: { schema: { time: 0, stack: 1, threadCPUDelta: 2 }, data: [[10, 0, null], [5010, 0, 1000000]] },
+      }));
+      return { meta: { sampleUnits: { threadCPUDelta: 'ns' } }, threads: [], processes: [{ threads }] };
+    },
+  });
+  expect(report.results.map(row => row.cpu_execution.total_cpu_ms_per_update)).toEqual([9 / 500, 1 / 500]);
+  expect(report.results[1].cpu_execution.workers_cpu_ms_per_update).toBe(0);
+  expect(fake.saved[0].results[0].cpu_execution.supported).toBe(true);
+  expect(logs).toContain('Full benchmark report: fake.json');
+  expect(logs.at(-1)).toBe(formatSummary(report));
+  expect(logs.at(-1)).toMatch(/threaded\s+8\s+0\.00\s+0\.02\s+0\.02\s+unavailable\s+100\.00/);
+  expect(logs.at(-1)).toMatch(/serial\s+0\s+0\.00\s+0\.00\s+0\.00\s+unavailable\s+100\.00/);
+  expect(logs.at(-1)).not.toMatch(/stack_coverage|Other_or_unclassified|Wasm_samples/);
+  expect(fake.saved[0].results).toEqual(report.results);
+  expect(fake.saved[0].results[0].cpu_execution.coverage.stack_samples).toBe(9);
+});
+
+test('summary rounds only presentation, preserves zero and does not mutate raw JSON', () => {
+  const report = { configuration: { movingMeshes: 100, cpuWork: 3 }, results: [{
+    mode: 'threaded', requested_workers: 8, measuredFPS: 104.587,
+    cpu_execution: { supported: true, main_cpu_ms_per_update: 1.234,
+      workers_cpu_ms_per_update: 0, total_cpu_ms_per_update: 1.234,
+      coverage: { stack_samples: 123 } },
+  }] };
+  const raw = JSON.stringify(report);
+  const summary = formatSummary(report);
+  expect(summary.split('\n')).toEqual([
+    'Bevy benchmark — moving meshes: 100; CPU work: 3',
+    'Mode      Workers  Main CPU ms/update  Workers CPU ms/update  Total CPU ms/update  GPU ms/frame  Updates/sec',
+    'threaded  8                      1.23                   0.00                 1.23   unavailable       104.59',
+    'CPU is sampled Wasm attribution, not frame time; profiling affects update cadence.',
+    'GPU is timestamped disjoint instrumented passes per sampled render frame; excludes copies and uninstrumented passes. See JSON for sample coverage.',
+  ]);
+  expect(JSON.stringify(report)).toBe(raw);
+});
+
+test('summary keeps unsupported, missing and nonfinite CPU concise without NaN', () => {
+  const report = { configuration: { movingMeshes: 1, cpuWork: 0 }, results: [
+    { mode: 'serial', requested_workers: 0, measuredFPS: 0,
+      cpu_execution: { supported: false, main_cpu_ms_per_update: 99,
+        reason: 'Profile unavailable\n    at noisy stack frame' } },
+    { mode: 'threaded', requested_workers: 4, measuredFPS: Infinity },
+    { mode: 'threaded', requested_workers: 8, measuredFPS: 10,
+      cpu_execution: { supported: true, main_cpu_ms_per_update: NaN,
+        workers_cpu_ms_per_update: Infinity, reason: 'x'.repeat(200) } },
+  ] };
+  const summary = formatSummary(report);
+  expect(summary).toMatch(/serial\s+0\s+unavailable\s+unavailable\s+unavailable\s+unavailable\s+0\.00/);
+  expect(summary).toContain('CPU unavailable — serial/0: Profile unavailable');
+  expect(summary).toContain('CPU unavailable — threaded/4: CPU samples unavailable');
+  expect(summary).toContain('CPU unavailable — threaded/8: ' + 'x'.repeat(97) + '...');
+  expect(summary).not.toMatch(/NaN|Infinity|noisy stack|99\.00/);
 });
 
 test('custom worker pairs and scene counts retain independent cases and metadata', async () => {
@@ -230,7 +357,7 @@ test('visible launcher uses the same updated artifacts and uncapped two-case run
 test('failure cleans up, saves diagnostics and never retries', async () => {
   const fake = fixture(true);
   await expect(run(fake.dependencies)).rejects.toThrow('renderer failed');
-  expect(fake.events).toEqual(['browser-create:threaded', 'http://127.0.0.1:1234/?mode=threaded&workers=4&meshes=1&cpu-work=0',
+  expect(fake.events).toEqual(['browser-create:threaded', 'http://127.0.0.1:1234/?mode=threaded&workers=4&meshes=1&cpu-work=0&profile-controlled=1',
     'browser-close:threaded', 'server-close']);
   expect(fake.creations).toHaveLength(1);
   expect(fake.options.signal.aborted).toBe(true);

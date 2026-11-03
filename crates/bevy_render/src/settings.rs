@@ -44,6 +44,9 @@ pub struct WgpuSettings {
     /// The features to ensure are enabled regardless of what the adapter/backend supports.
     /// Setting these explicitly may cause renderer initialization to fail.
     pub features: WgpuFeatures,
+    /// Optional features, enabled only when supported by the selected adapter.
+    /// Unlike `features`, absence never makes device initialization fail.
+    pub optional_features: WgpuFeatures,
     /// The features to ensure are disabled regardless of what the adapter/backend supports
     pub disabled_features: Option<WgpuFeatures>,
     /// The imposed limits.
@@ -65,6 +68,30 @@ pub struct WgpuSettings {
     pub force_fallback_adapter: bool,
     /// The name of the adapter to use.
     pub adapter_name: Option<String>,
+}
+
+impl WgpuSettings {
+    pub(crate) fn supported_optional_features(&self, supported: WgpuFeatures) -> WgpuFeatures {
+        (self.optional_features & supported) & !self.disabled_features.unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod timestamp_feature_tests {
+    use super::*;
+    #[test]
+    fn optional_timestamps_never_require_unsupported_features() {
+        let mut settings = WgpuSettings {
+            features: WgpuFeatures::empty(),
+            optional_features: WgpuFeatures::TIMESTAMP_QUERY,
+            ..Default::default()
+        };
+        assert_eq!(settings.supported_optional_features(WgpuFeatures::empty()), WgpuFeatures::empty());
+        assert_eq!(settings.supported_optional_features(WgpuFeatures::all()), WgpuFeatures::TIMESTAMP_QUERY);
+        assert!(!settings.features.contains(WgpuFeatures::TIMESTAMP_QUERY));
+        settings.disabled_features = Some(WgpuFeatures::TIMESTAMP_QUERY);
+        assert_eq!(settings.supported_optional_features(WgpuFeatures::all()), WgpuFeatures::empty());
+    }
 }
 
 impl Default for WgpuSettings {
@@ -149,6 +176,7 @@ impl Default for WgpuSettings {
             power_preference,
             priority,
             features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+            optional_features: WgpuFeatures::empty(),
             disabled_features: None,
             limits,
             constrained_limits: None,

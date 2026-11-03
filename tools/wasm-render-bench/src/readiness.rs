@@ -35,12 +35,17 @@ pub struct SamplingGate {
     pub elapsed_ms: f64,
     pub warmup_ms: f64,
     pub phase: &'static str,
+    pub capture_epoch: u64,
 }
 
 impl SamplingGate {
     pub fn tick(&mut self, now: f64, state: Readiness) -> bool {
+        self.tick_with_capture(now, state, None)
+    }
+
+    pub fn tick_with_capture(&mut self, now: f64, state: Readiness, capture: Option<u64>) -> bool {
         if self.previous_state != Some(state) {
-            *self = Self { previous_state: Some(state), ..Self::default() };
+            *self = Self { previous_state: Some(state), capture_epoch: self.capture_epoch + 1, ..Self::default() };
         }
         if !state.ready() {
             self.window.tick(now, false);
@@ -49,6 +54,10 @@ impl SamplingGate {
         }
         let ready_at = *self.ready_at.get_or_insert(now);
         let warmed = now - ready_at >= timing::WARMUP_MS;
+        if warmed && capture.is_some_and(|epoch| epoch != self.capture_epoch) {
+            self.phase = "Preparing CPU capture";
+            return false;
+        }
         self.phase = if warmed { "Measuring (5 seconds)" } else { "Warming up (5 seconds after graphics readiness)" };
         let Some(frame) = self.window.tick(now, true) else { return false; };
         if self.frames == 0 { self.warmup_ms = now - frame.interval_ms - ready_at; }
@@ -123,6 +132,31 @@ mod tests {
         assert!(!gate.tick(51_000.0, all));
         assert!(!gate.tick(51_010.0, all));
         assert_eq!(gate.elapsed_ms, 10.0);
+    }
+
+    #[test]
+    fn capture_handshake_excludes_loading_warmup_and_arbitrary_driver_delay() {
+        let mut gate = SamplingGate::default();
+        gate.tick_with_capture(30_000.0, ready(), Some(0));
+        gate.tick_with_capture(35_000.0, ready(), Some(0));
+        assert_eq!(gate.phase, "Preparing CPU capture");
+        gate.tick_with_capture(55_000.0, ready(), Some(0));
+        assert_eq!(gate.frames, 0);
+        let epoch = gate.capture_epoch;
+        gate.tick_with_capture(55_100.0, ready(), Some(epoch));
+        assert_eq!(gate.phase, "Measuring (5 seconds)");
+        assert_eq!(gate.frames, 0);
+        gate.tick_with_capture(55_102.5, ready(), Some(epoch));
+        assert_eq!(gate.frames, 1);
+        assert_eq!(gate.elapsed_ms, 2.5);
+        assert!(gate.tick_with_capture(60_100.0, ready(), Some(epoch)));
+        assert_eq!(gate.elapsed_ms, 5000.0);
+        gate.tick_with_capture(60_101.0, Readiness::default(), Some(epoch));
+        gate.tick_with_capture(61_000.0, ready(), Some(epoch));
+        gate.tick_with_capture(66_000.0, ready(), Some(epoch));
+        assert_eq!(gate.phase, "Preparing CPU capture");
+        assert!(gate.capture_epoch > epoch);
+        assert_eq!(gate.frames, 0);
     }
 
     #[test]

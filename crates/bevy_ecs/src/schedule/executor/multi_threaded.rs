@@ -331,18 +331,30 @@ impl SystemExecutor for MultiThreadedExecutor {
 
 impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
     fn system_completed(&self, system_index: usize, res: Result<(), Box<dyn Any + Send>>) {
-        // tell the executor that the system finished
-        self.environment
-            .executor
-            .system_completion
-            .push(SystemResult { system_index })
-            .unwrap_or_else(|error| unreachable!("{}", error));
         if let Err(payload) = res {
             // set the payload to propagate the error
             let mut panic_payload = self.environment.executor.panic_payload.lock().unwrap();
             *panic_payload = Some(payload);
         }
-        self.tick_executor();
+        // Most completions can update the scheduler immediately. Avoid a
+        // concurrent-queue round trip when we already have exclusive state access.
+        if let Some((conditions, mut guard)) = self.try_lock() {
+            guard.finish_system_and_handle_dependents(SystemResult { system_index });
+            guard.tick(self, conditions);
+            drop(guard);
+            // As in tick_executor, check after unlocking so contending workers
+            // cannot leave an event stranded between their push and our unlock.
+            if !self.environment.executor.system_completion.is_empty() {
+                self.tick_executor();
+            }
+        } else {
+            self.environment
+                .executor
+                .system_completion
+                .push(SystemResult { system_index })
+                .unwrap_or_else(|error| unreachable!("{}", error));
+            self.tick_executor();
+        }
     }
 
     #[expect(
@@ -435,7 +447,7 @@ impl ExecutorState {
     /// - `world_cell` must have permission to access all world data (not counting
     ///   any world data that is claimed by systems currently running on this executor).
     unsafe fn spawn_system_tasks(&mut self, context: &Context, conditions: &mut Conditions) {
-        if self.exclusive_running {
+        if self.exclusive_running || self.ready_systems.is_clear() {
             return;
         }
 
@@ -963,6 +975,53 @@ mod tests {
             _change_tick: Tick,
         ) -> Result<Self::Item<'world, 'state>, SystemParamValidationError> {
             Ok(ExclusiveMarker)
+        }
+    }
+
+    #[test]
+    fn completions_bypass_the_queue_unless_the_state_is_locked() {
+        use super::{Context, Environment, SystemSchedule};
+        use crate::{error::panic as panic_handler, schedule::SystemExecutor};
+        use bevy_tasks::TaskPoolBuilder;
+
+        let pool = TaskPoolBuilder::new().num_threads(2).build();
+        for contended in [false, true] {
+            let mut world = World::new();
+            let mut schedule = Schedule::default();
+            schedule.add_systems(|| {});
+            schedule.initialize(&mut world).unwrap();
+            let mut executor = MultiThreadedExecutor::new();
+            executor.init(schedule.executable());
+            let state = executor.state.get_mut().unwrap();
+            state.num_running_systems = 1;
+            state.running_systems.insert(0);
+            if !contended {
+                // A closed queue makes any accidental enqueue fail immediately.
+                executor.system_completion.close();
+            }
+            let mut empty = SystemSchedule::new();
+            let environment = Environment::new(&executor, &mut empty, &mut world);
+            pool.scope(|scope| {
+                let context = Context {
+                    environment: &environment,
+                    scope,
+                    error_handler: panic_handler,
+                };
+                if contended {
+                    let guard = executor.state.lock().unwrap();
+                    context.system_completed(0, Ok(()));
+                    assert_eq!(executor.system_completion.len(), 1);
+                    drop(guard);
+                    context.tick_executor();
+                } else {
+                    context.system_completed(0, Ok(()));
+                }
+            });
+            let state = executor.state.lock().unwrap();
+            assert_eq!(state.num_running_systems, 0);
+            assert!(state.running_systems.is_clear());
+            assert!(state.completed_systems.contains(0));
+            assert!(executor.system_completion.is_empty());
         }
     }
 

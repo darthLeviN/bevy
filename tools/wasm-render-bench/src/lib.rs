@@ -14,8 +14,15 @@ mod motion;
 mod workload;
 mod heavy;
 mod readiness;
-mod timings;
-mod timing_stats;
+mod gpu;
+
+#[derive(Resource, Clone, Default)]
+struct GpuSamples(Arc<Mutex<gpu::Window>>);
+
+fn tag_gpu_frame(samples: Res<GpuSamples>, mut recorder: ResMut<bevy::render::diagnostic::DiagnosticsRecorder>) {
+    recorder.set_frame_tag(samples.0.lock().unwrap().tag);
+}
+
 use readiness::{Readiness, SamplingGate};
 
 #[derive(Resource, Clone)]
@@ -73,6 +80,8 @@ struct Measurement {
     finished: bool,
     threaded: bool,
     motion_ready: bool,
+    pending_result: Option<String>,
+    drain_updates: u32,
 }
 
 #[wasm_bindgen]
@@ -95,9 +104,19 @@ pub async fn start(threaded: bool, shim_url: String, worker_url: String, workers
     }
     let mut app = App::new();
     let readiness = GraphicsReadiness::default();
+    let gpu_samples = GpuSamples::default();
+    app.insert_resource(gpu_samples.clone());
     app.insert_resource(readiness.clone()).insert_resource(config.clone());
     app.insert_resource(Measurement { threaded, ..default() })
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
+        .add_plugins(DefaultPlugins.set(bevy::render::RenderPlugin {
+            render_creation: bevy::render::settings::WgpuSettings {
+                priority: bevy::render::settings::WgpuSettingsPriority::WebGPU,
+                features: bevy::render::settings::WgpuFeatures::empty(),
+                optional_features: bevy::render::settings::WgpuFeatures::TIMESTAMP_QUERY,
+                ..default()
+            }.into(),
+            ..default()
+        }).set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Bevy minimal FPS benchmark".into(),
                 canvas: Some("#scene".into()),
@@ -107,11 +126,16 @@ pub async fn start(threaded: bool, shim_url: String, worker_url: String, workers
             }),
             ..default()
         }))
+        .add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
         .add_systems(Startup, setup)
         .add_systems(Last, measure);
     if cpu_work > 0 { heavy::install(&mut app); }
     else { app.add_systems(Update, animate); }
     app.sub_app_mut(RenderApp).insert_resource(readiness).insert_resource(config)
+        .insert_resource(gpu_samples)
+        .add_systems(Render, tag_gpu_frame
+            .after(bevy::render::diagnostic::begin_diagnostics_frame)
+            .before(RenderSystems::PrepareAssets))
         .add_systems(Render, publish_readiness.in_set(RenderSystems::PostCleanup));
     // WebGPU handles are browser-thread-affine. Keep GPU sub-app schedules on
     // that thread; the main world's eligible ECS work and parallel queries use workers.
@@ -122,7 +146,7 @@ pub async fn start(threaded: bool, shim_url: String, worker_url: String, workers
             }
         }
     }
-    if option_env!("BEVY_RENDER_TIMINGS").is_some() { timings::install(&mut app); }
+
     app.run();
 }
 
@@ -209,12 +233,30 @@ fn verify_motion(moving: &Query<(&Moving, &Transform)>, expected_count: usize, s
 
 fn measure(
     mut measurement: ResMut<Measurement>, readiness: Res<GraphicsReadiness>, config: Res<MainConfig>,
-    timings: Option<Res<timings::Timings>>,
+    gpu_samples: Res<GpuSamples>, gpu_results: Res<bevy::render::diagnostic::GpuFrameTimings>,
+
     time: Res<Time>, moving: Query<(&Moving, &Transform)>, cameras: Query<&Camera>,
     meshes: Query<(&Mesh3d, &MeshMaterial3d<StandardMaterial>)>,
     entities: Query<heavy::OutputsReadOnly>, materials: Res<Assets<StandardMaterial>>, _: NonSendMarker,
 ) {
+    let mut gpu = gpu_samples.0.lock().unwrap();
+    for sample in gpu_results.drain() {
+        gpu.receive(sample.frame_tag, sample.elapsed_ms, sample.missed_passes);
+    }
+    gpu.tag = None;
     if measurement.finished {
+        if measurement.pending_result.is_some() {
+            measurement.drain_updates += 1;
+            // Bound asynchronous draining without blocking the queue or changing
+            // measured cadence. Missing results remain explicit in coverage.
+            if gpu.drained() || measurement.drain_updates >= 120 {
+                let result = measurement.pending_result.take().unwrap().replace("__GPU_TIMING__", &gpu.json());
+                info!(target: "bevy_benchmark", "{result}");
+                let element = web_sys::window().unwrap().document().unwrap().get_element_by_id("result").unwrap();
+                element.set_text_content(Some(&result));
+                element.set_attribute("data-complete", "true").unwrap();
+            }
+        }
         return;
     }
     if !measurement.motion_ready {
@@ -227,10 +269,26 @@ fn measure(
     let mut ready = *readiness.0.lock().unwrap();
     ready.motion_updated = measurement.motion_ready;
     let previous_phase = measurement.sample.phase;
-    let complete = measurement.sample.tick(now, ready);
-    if previous_phase != measurement.sample.phase {
-        if let Some(timings) = &timings { timings.reset(); }
+    let previous_frames = measurement.sample.frames;
+    let element = window.document().unwrap().get_element_by_id("result").unwrap();
+    let capture = element.get_attribute("data-profile-ready").map(|value| value.parse::<u64>().unwrap_or(0));
+    let complete = measurement.sample.tick_with_capture(now, ready, capture);
+    if measurement.sample.phase == "Preparing CPU capture" {
+        element.set_attribute("data-profile-request", &measurement.sample.capture_epoch.to_string()).unwrap();
     }
+    if measurement.sample.frames < previous_frames || (previous_phase == "Measuring (5 seconds)" && previous_phase != measurement.sample.phase) {
+        gpu.reset();
+    }
+    if measurement.sample.frames > previous_frames { gpu.submit(); }
+    if previous_phase != measurement.sample.phase {
+        let name = if measurement.sample.phase == "Measuring (5 seconds)" {
+            "benchmark-cpu-start"
+        } else {
+            "benchmark-cpu-reset"
+        };
+        window.performance().unwrap().mark(name).unwrap();
+    }
+    if complete { window.performance().unwrap().mark("benchmark-cpu-end").unwrap(); }
     if measurement.displayed_phase != measurement.sample.phase {
         measurement.displayed_phase = measurement.sample.phase;
         window.document().unwrap().get_element_by_id("result").unwrap()
@@ -255,16 +313,13 @@ fn measure(
         let fps = measurement.sample.frames as f64 * 1000.0 / measurement.sample.elapsed_ms;
         let mode = if measurement.threaded { "threaded" } else { "serial" };
         let workers = ComputeTaskPool::get().thread_num();
-        let schedule_timings = timings.as_ref().map(|timings| timings.json()).unwrap_or_else(|| "[]".into());
+
         let result = format!(
-            r#"{{"mode":"{mode}","fps":{fps},"frames":{},"measurement_ms":{},"warmup_ms":{},"graphics_ready":true,"compute_workers":{workers},"moving_meshes":{moving_meshes},"unique_materials":{unique_materials},"motion_verified":true,"cpu_work":{cpu_work},"cpu_systems":{cpu_systems},"cpu_verified":true,"cameras":{},"meshes":{},"unlit":true,"msaa_samples":1,"optimization":"{}","page_main_thread":true,"gpu_thread":"browser-main","schedule_timings":{schedule_timings}}}"#,
+            r#"{{"mode":"{mode}","fps":{fps},"frames":{},"measurement_ms":{},"warmup_ms":{},"graphics_ready":true,"compute_workers":{workers},"moving_meshes":{moving_meshes},"unique_materials":{unique_materials},"motion_verified":true,"cpu_work":{cpu_work},"cpu_systems":{cpu_systems},"cpu_verified":true,"cameras":{},"meshes":{},"unlit":true,"msaa_samples":1,"optimization":"{}","page_main_thread":true,"gpu_thread":"browser-main","gpu_timing":__GPU_TIMING__}}"#,
             measurement.sample.frames, measurement.sample.elapsed_ms, measurement.sample.warmup_ms,
             cameras.iter().count(), mesh_count,
             env!("BENCH_OPT_LEVEL"),
         );
-        info!(target: "bevy_benchmark", "{result}");
-        let element = window.document().unwrap().get_element_by_id("result").unwrap();
-        element.set_text_content(Some(&result));
-        element.set_attribute("data-complete", "true").unwrap();
+        measurement.pending_result = Some(result);
     }
 }

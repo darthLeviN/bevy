@@ -101,6 +101,55 @@ impl DiagnosticsRecorder {
         self.current_frame_mut().begin();
     }
 
+    /// Associates caller-owned sampling metadata with this frame, before recording passes.
+    pub fn set_frame_tag(&mut self, tag: Option<u64>) {
+        self.current_frame_mut().frame_tag = tag;
+    }
+
+    fn pass_timestamp_queries(&self) -> Option<(QuerySet, u32, u32)> {
+        let mut frame = self.current_frame_lock();
+        let supported = frame.timestamps_query_set.is_some();
+        let Some((begin, end)) = allocate_pass_queries(supported, &mut frame.num_timestamps) else {
+            frame.missed_passes += 1;
+            return None;
+        };
+        frame.pass_queries.push((begin, end));
+        Some((frame.timestamps_query_set.as_ref().unwrap().clone(), begin, end))
+    }
+
+    /// Begins a render pass with optional pass-boundary timestamps. Explicit caller
+    /// timestamp writes are preserved and excluded from the recorder's pass total.
+    pub fn begin_render_pass<'a>(
+        &self,
+        encoder: &'a mut CommandEncoder,
+        descriptor: &wgpu::RenderPassDescriptor<'_>,
+    ) -> RenderPass<'a> {
+        let queries = if descriptor.timestamp_writes.is_none() { self.pass_timestamp_queries() } else { None };
+        let mut descriptor = descriptor.clone();
+        if let Some((ref set, begin, end)) = queries {
+            descriptor.timestamp_writes = Some(wgpu::RenderPassTimestampWrites {
+                query_set: set, beginning_of_pass_write_index: Some(begin), end_of_pass_write_index: Some(end),
+            });
+        }
+        encoder.begin_render_pass(&descriptor)
+    }
+
+    /// Begins a compute pass with optional pass-boundary timestamps.
+    pub fn begin_compute_pass<'a>(
+        &self,
+        encoder: &'a mut CommandEncoder,
+        descriptor: &wgpu::ComputePassDescriptor<'_>,
+    ) -> ComputePass<'a> {
+        let queries = if descriptor.timestamp_writes.is_none() { self.pass_timestamp_queries() } else { None };
+        let mut descriptor = descriptor.clone();
+        if let Some((ref set, begin, end)) = queries {
+            descriptor.timestamp_writes = Some(wgpu::ComputePassTimestampWrites {
+                query_set: set, beginning_of_pass_write_index: Some(begin), end_of_pass_write_index: Some(end),
+            });
+        }
+        encoder.begin_compute_pass(&descriptor)
+    }
+
     /// Copies data from [`QuerySet`]'s to a [`Buffer`], after which it can be downloaded to CPU.
     ///
     /// Should be called before [`DiagnosticsRecorder::finish_frame`].
@@ -231,7 +280,11 @@ struct FrameData {
     closed_spans: Vec<SpanRecord>,
     value_buffers: Vec<(Buffer, Cow<'static, str>, bool)>,
     is_mapped: Arc<AtomicBool>,
+    map_failed: Arc<AtomicBool>,
     callback: Option<Box<dyn FnOnce(RenderDiagnostics) + Send + Sync + 'static>>,
+    frame_tag: Option<u64>,
+    pass_queries: Vec<(u32, u32)>,
+    missed_passes: u32,
     #[cfg(feature = "tracing-tracy")]
     tracy_gpu_context: Option<tracy_client::GpuContext>,
 }
@@ -307,13 +360,20 @@ impl FrameData {
             closed_spans: Vec::new(),
             value_buffers: Vec::new(),
             is_mapped: Arc::new(AtomicBool::new(false)),
+            map_failed: Arc::new(AtomicBool::new(false)),
             callback: None,
+            frame_tag: None,
+            pass_queries: Vec::new(),
+            missed_passes: 0,
             #[cfg(feature = "tracing-tracy")]
             tracy_gpu_context,
         }
     }
 
     fn begin(&mut self) {
+        self.frame_tag = None;
+        self.pass_queries.clear();
+        self.missed_passes = 0;
         self.num_timestamps = 0;
         self.num_pipeline_statistics = 0;
         self.path_components.clear();
@@ -552,16 +612,21 @@ impl FrameData {
                 });
             }
 
-            callback(RenderDiagnostics(diagnostics));
+            callback(RenderDiagnostics {
+                diagnostics,
+                gpu: GpuFrameTiming { frame_tag: self.frame_tag, elapsed_ms: None, timed_passes: 0, missed_passes: self.missed_passes },
+            });
             return;
         };
 
         self.callback = Some(Box::new(callback));
 
         let is_mapped = self.is_mapped.clone();
+        let map_failed = self.map_failed.clone();
         read_buffer.slice(..).map_async(MapMode::Read, move |res| {
             if let Err(e) = res {
                 bevy_log::warn!("Failed to download render statistics buffer: {e}");
+                map_failed.store(true, Ordering::Release);
                 return;
             }
 
@@ -574,6 +639,15 @@ impl FrameData {
         let Some(read_buffer) = &self.read_buffer else {
             return true;
         };
+        if self.map_failed.swap(false, Ordering::AcqRel) {
+            if let Some(callback) = self.callback.take() {
+                callback(RenderDiagnostics {
+                    diagnostics: Vec::new(),
+                    gpu: GpuFrameTiming { frame_tag: self.frame_tag, missed_passes: self.missed_passes, ..Default::default() },
+                });
+            }
+            return true;
+        }
         if !self.is_mapped.load(Ordering::Acquire) {
             // need to wait more
             return false;
@@ -693,7 +767,15 @@ impl FrameData {
             });
         }
 
-        callback(RenderDiagnostics(diagnostics));
+        callback(RenderDiagnostics {
+            diagnostics,
+            gpu: GpuFrameTiming {
+                frame_tag: self.frame_tag,
+                elapsed_ms: pass_total_ms(&timestamps, &self.pass_queries, timestamp_period_ns),
+                timed_passes: self.pass_queries.len() as u32,
+                missed_passes: self.missed_passes,
+            },
+        });
 
         drop(data);
         read_buffer.unmap();
@@ -705,7 +787,36 @@ impl FrameData {
 
 /// Resource which stores render diagnostics of the most recent frame.
 #[derive(Debug, Default, Clone, Resource)]
-pub struct RenderDiagnostics(Vec<RenderDiagnostic>);
+pub struct RenderDiagnostics {
+    diagnostics: Vec<RenderDiagnostic>,
+    pub(crate) gpu: GpuFrameTiming,
+}
+
+/// GPU execution time of disjoint recorder-instrumented render/compute passes.
+/// Excludes copies, idle time, nested diagnostic spans and uninstrumented passes.
+#[derive(Debug, Default, Clone)]
+pub struct GpuFrameTiming {
+    pub frame_tag: Option<u64>,
+    pub elapsed_ms: Option<f64>,
+    pub timed_passes: u32,
+    pub missed_passes: u32,
+}
+
+fn allocate_pass_queries(supported: bool, used: &mut u32) -> Option<(u32, u32)> {
+    if !supported || *used > MAX_TIMESTAMP_QUERIES - 2 { return None; }
+    let begin = *used;
+    *used += 2;
+    Some((begin, begin + 1))
+}
+
+fn pass_total_ms(timestamps: &[u64], pairs: &[(u32, u32)], period: f32) -> Option<f64> {
+    if pairs.is_empty() { return None; }
+    let mut ticks = 0u64;
+    for &(begin, end) in pairs {
+        ticks = ticks.checked_add(timestamps.get(end as usize)?.checked_sub(*timestamps.get(begin as usize)?)?)?;
+    }
+    Some(ticks as f64 * period as f64 / 1e6)
+}
 
 /// A render diagnostic which has been recorded, but not yet stored in [`DiagnosticsStore`].
 #[derive(Debug, Clone, Resource)]
@@ -731,7 +842,7 @@ pub fn sync_diagnostics(mutex: Res<RenderDiagnosticsMutex>, mut store: ResMut<Di
 
     let time = Instant::now();
 
-    for diagnostic in &diagnostics.0 {
+    for diagnostic in &diagnostics.diagnostics {
         if store.get(&diagnostic.path).is_none() {
             store.add(Diagnostic::new(diagnostic.path.clone()).with_suffix(diagnostic.suffix));
         }
@@ -817,4 +928,86 @@ impl Pass for ComputePass<'_> {
 pub enum PassKind {
     Render,
     Compute,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pass_queries_require_only_base_feature_and_reserve_atomic_pairs() {
+        let mut used = 0;
+        assert_eq!(allocate_pass_queries(false, &mut used), None);
+        assert_eq!(used, 0);
+        assert_eq!(allocate_pass_queries(true, &mut used), Some((0, 1)));
+        used = MAX_TIMESTAMP_QUERIES - 1;
+        assert_eq!(allocate_pass_queries(true, &mut used), None);
+        assert_eq!(used, MAX_TIMESTAMP_QUERIES - 1);
+        used -= 1;
+        assert_eq!(allocate_pass_queries(true, &mut used), Some((MAX_TIMESTAMP_QUERIES - 2, MAX_TIMESTAMP_QUERIES - 1)));
+        assert_eq!(allocate_pass_queries(true, &mut used), None);
+    }
+
+    #[test]
+    fn pass_total_ignores_nested_spans_and_rejects_invalid_readback() {
+        // Entries 2/3 represent an enclosing native span, not a pass.
+        let timestamps = [10, 20, 0, 100, 30, 50];
+        assert_eq!(pass_total_ms(&timestamps, &[(0, 1), (4, 5)], 1000.0), Some(0.03));
+        assert_eq!(pass_total_ms(&timestamps, &[], 1.0), None);
+        assert_eq!(pass_total_ms(&timestamps, &[(1, 0)], 1.0), None);
+        assert_eq!(pass_total_ms(&timestamps, &[(0, 6)], 1.0), None);
+    }
+
+    #[test]
+    fn base_timestamp_feature_plans_render_and_compute_boundaries() {
+        let (device, queue) = crate::test_utils::create_dummy_device_with_features(Features::TIMESTAMP_QUERY);
+        let info = RenderAdapterInfo(wgpu::AdapterInfo::new(wgpu::DeviceType::Cpu, wgpu::Backend::Noop));
+        let mut recorder = DiagnosticsRecorder::new(&info, &device, &queue);
+        recorder.begin_frame();
+        recorder.set_frame_tag(Some(42));
+        let mut encoder = device.create_command_encoder(&Default::default());
+        drop(recorder.begin_compute_pass(&mut encoder, &Default::default()));
+        drop(recorder.begin_render_pass(&mut encoder, &Default::default()));
+        let frame = recorder.current_frame_lock();
+        assert!(!frame.supports_timestamps_inside_encoders);
+        assert!(!frame.supports_timestamps_inside_passes);
+        assert_eq!(frame.pass_queries, [(0, 1), (2, 3)]);
+        assert_eq!(frame.frame_tag, Some(42));
+        drop(frame);
+        recorder.resolve(&mut encoder);
+        queue.submit([encoder.finish()]);
+    }
+
+    #[test]
+    fn failed_readback_completes_with_original_tag_and_can_be_recycled() {
+        let (device, _) = crate::test_utils::create_dummy_device_with_features(Features::TIMESTAMP_QUERY);
+        let mut frame = FrameData::new(&device, Features::TIMESTAMP_QUERY,
+            #[cfg(feature = "tracing-tracy")] None);
+        frame.frame_tag = Some(7);
+        frame.callback = Some(Box::new(|result| {
+            assert_eq!(result.gpu.frame_tag, Some(7));
+            assert!(result.gpu.elapsed_ms.is_none());
+        }));
+        assert!(!frame.run_mapped_callback(1.0));
+        frame.map_failed.store(true, Ordering::Release);
+        assert!(frame.run_mapped_callback(1.0));
+        assert!(frame.callback.is_none());
+        frame.begin();
+        assert_eq!(frame.frame_tag, None);
+    }
+
+    #[test]
+    fn unsupported_device_can_encode_both_pass_kinds_without_query_features() {
+        let (device, queue) = crate::test_utils::create_dummy_device();
+        let info = RenderAdapterInfo(wgpu::AdapterInfo::new(wgpu::DeviceType::Cpu, wgpu::Backend::Noop));
+        let mut recorder = DiagnosticsRecorder::new(&info, &device, &queue);
+        recorder.begin_frame();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        drop(recorder.begin_compute_pass(&mut encoder, &Default::default()));
+        drop(recorder.begin_render_pass(&mut encoder, &Default::default()));
+        assert_eq!(recorder.current_frame_lock().num_timestamps, 0);
+        recorder.resolve(&mut encoder);
+        queue.submit([encoder.finish()]);
+        recorder.finish_frame(&device, |result| assert!(result.gpu.elapsed_ms.is_none()));
+    }
 }

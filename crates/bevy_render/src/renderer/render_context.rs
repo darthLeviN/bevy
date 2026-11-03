@@ -275,8 +275,23 @@ impl<'w, 's> RenderContext<'w, 's> {
                 })
         });
 
-        let render_pass = command_encoder.begin_render_pass(&descriptor);
+        let render_pass = if let Some(recorder) = &self.diagnostics_recorder {
+            recorder.begin_render_pass(command_encoder, &descriptor)
+        } else {
+            command_encoder.begin_render_pass(&descriptor)
+        };
         TrackedRenderPass::new(&self.render_device, render_pass)
+    }
+
+    /// Begins a compute pass with optional diagnostic pass-boundary timestamps.
+    pub fn begin_compute_pass<'a>(&'a mut self, descriptor: &wgpu::ComputePassDescriptor<'_>) -> wgpu::ComputePass<'a> {
+        self.ensure_device();
+        let encoder = self.state.command_encoder(self.system_name.as_str());
+        if let Some(recorder) = &self.diagnostics_recorder {
+            recorder.begin_compute_pass(encoder, descriptor)
+        } else {
+            encoder.begin_compute_pass(descriptor)
+        }
     }
 
     /// Adds a finished command buffer to be submitted later.

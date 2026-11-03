@@ -321,6 +321,46 @@ fn deferred_metadata_keeps_commands_custom_buffers_and_exclusive_systems_correct
 }
 
 #[test]
+fn concurrent_completions_preserve_fan_in_dependencies_across_frames() {
+    use bevy_ecs::{prelude::*, schedule::MultiThreadedExecutor};
+    use bevy_tasks::ComputeTaskPool;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct Work;
+    #[derive(Resource, Default)]
+    struct Frames(usize);
+
+    ComputeTaskPool::get_or_init(|| TaskPoolBuilder::new().num_threads(2).build());
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    let mut world = World::new();
+    world.init_resource::<Frames>();
+    let mut schedule = Schedule::default();
+    schedule.set_executor(MultiThreadedExecutor::new());
+    for _ in 0..32 {
+        let completed = completed.clone();
+
+        schedule.add_systems((move || {
+
+            completed.fetch_add(1, Ordering::Release);
+        }).in_set(Work));
+    }
+    let observed = completed.clone();
+    schedule.add_systems((
+        (|| panic!("skipped predecessor ran")).run_if(|| false),
+        move |mut frames: ResMut<Frames>| {
+            frames.0 += 1;
+            assert_eq!(observed.load(Ordering::Acquire), frames.0 * 32);
+        },
+        |world: &mut World| { assert!(world.resource::<Frames>().0 > 0); },
+    ).chain().after(Work));
+    for _ in 0..64 { schedule.run(&mut world); }
+    assert_eq!(world.resource::<Frames>().0, 64);
+    assert_eq!(completed.load(Ordering::Acquire), 64 * 32);
+}
+
+#[test]
 fn caller_can_execute_cpu_tasks_while_all_workers_are_busy() {
     use std::sync::{Arc, Mutex, Condvar, mpsc};
     struct Release(Arc<(Mutex<bool>, Condvar)>);

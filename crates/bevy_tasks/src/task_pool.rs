@@ -460,7 +460,15 @@ impl TaskPool {
                 let get_results = async {
                     let mut results = Vec::with_capacity(spawned.len());
                     while let Ok(task) = spawned.pop() {
-                        if let Some(res) = task.await {
+                        #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+                        let result = if !crate::is_web_worker_thread() {
+                            crate::polling_scope::wait_for_task(task, |task| task.is_finished()).await
+                        } else {
+                            task.await
+                        };
+                        #[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
+                        let result = task.await;
+                        if let Some(res) = result {
                             match res {
                                 Ok(res) => results.push(res),
                                 Err(payload) => std::panic::resume_unwind(payload),

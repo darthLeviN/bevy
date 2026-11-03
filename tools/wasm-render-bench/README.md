@@ -283,23 +283,152 @@ Observed threaded throughput rose 20.9%; the serial control rose 3.3%. This sing
 before/after pair is not evidence of a repeatable 20.9% speedup or of visible-browser
 performance. It measures application-update cadence, not physically displayed FPS.
 
-### Opt-in schedule attribution
+### OS CPU accounting and explicit GPU availability
 
-Set `BEVY_RENDER_TIMINGS=1` on the existing Cargo build command to install
-single-threaded boundary schedules around the main and render schedule orders,
-and a wrapper around the existing render extraction callback. Re-run the existing
-wasm-bindgen command afterward. Results include `schedule_timings`: completed
-span counts and mean wall milliseconds, reset when the sampling phase changes.
-Without this build environment variable no boundary schedules or extraction
-wrapper are installed; rebuild without it to restore the ordinary artifact.
-`profile.mjs` also accepts the runner's existing workload/worker CLI options.
+The default runner no longer installs wall-time boundary schedules or emits
+`schedule_timings`. It controls Firefox's supported `nsIProfiler` API and captures
+`GeckoMain` and `DOM Worker` threads. Profiles are saved beside the result JSON
+and read only after owned browser shutdown.
 
-These are diagnostic wall spans, not GPU timings or per-system attribution.
-Boundary schedules and clock/lock operations add overhead. `Last` contains the
-measurement reset/report itself, so its completed span count is one lower than
-the other schedules. Run the clock-injected accumulator regression with
-`rustc --edition=2024 --test src/timing_stats.rs -o /home/levi/dev/space-maker/.cache/bevy-web-ecs/render-target/timing-stats-tests`
-and then execute that test binary.
+After graphics readiness and at least five seconds of warmup, the page enters
+`Preparing CPU capture`. The runner starts a **fresh** recording, awaits profiler
+startup in subprocesses and one periodic sampling cycle, then acknowledges that
+readiness epoch. Only the next application callback establishes the measurement
+boundary; neither WebDriver latency nor polling defines measured time. There is
+no polling loop: mutation/performance observers deliver the request/end signal.
+Readiness changes invalidate the epoch, restart warmup and require a fresh capture.
+The end mark wakes the runner before asynchronous GPU-result draining. The runner
+awaits a bracketing sample, pauses recording and dumps the profile, so loading,
+warmup and GPU drain cannot consume its retained measurement history. Standalone
+pages without the runner's `profile-controlled=1` retain their ungated behavior.
+
+The recording requests 16,777,216 **eight-byte entries** (128 MiB per process), not
+bytes or samples. Sampling is 10 ms for up to four compute workers, increasing
+with larger worker counts to keep periodic thread samples roughly bounded
+(including the two auxiliary DOM workers). `cpu_capture` saves requested settings,
+actual Firefox configuration and the acknowledged epoch. The supported features
+are `js,stackwalk,nomarkerstacks`; current Firefox records OS thread CPU deltas
+without the obsolete `cpu`, `leaf` or `threads` feature names. Marker stacks are
+unnecessary for sampled Wasm attribution. Only controlled capture requests the
+geckodriver `--allow-system-access` flag, on the owned loopback driver, to permit
+the privileged profiler API. Inherited profiler environment overrides are removed
+from that owned child; other browser workflows retain their existing settings.
+
+The exact visible failure `2026-11-03T10-24-57.686Z.json` used **1 ms**, not 0.1 ms,
+sampling. Firefox clamped the earlier buffer request to 16,777,216 entries. In its
+threaded content process, retained samples started around 7569.6 ms, after the
+expected measurement start at 7332.991 ms; only the 12334.711 ms end mark survived.
+The earlier buffer increase therefore did not preserve the five-second window.
+
+Retention is no longer dependent on startup/warmup/drain duration. A deterministic
+variable-byte ring stress fixture reproduces old truncation and tests fresh capture
+at 1200 updates/s, 60 128-byte markers/update and 16 KiB/thread sample, across
+0–32 compute workers with six seconds of capture slack. This is a conservative
+**tested workload budget**, not a proof that arbitrary Firefox marker volume,
+stack depth, stalls or control-channel delays cannot overflow a finite buffer.
+CPU accounting still requires both original boundary marks and complete retained
+sample coverage for every included thread. Overflow, unknown units or missing
+attribution remain explicitly unavailable; no start marker is synthesized and no
+wall time or fake zero substitutes for missing CPU. Coarser sampling reduces
+perturbation but increases statistical uncertainty, particularly for short worker
+bursts; inspect sample/stack coverage and omitted-boundary bounds.
+
+The authorized headless one-mesh/four-worker/CPU-work-1 comparison
+`2026-11-03T10-36-28.404Z.json` returned sampled CPU in both cases (threaded total
+2.77 ms/update at 213.82 updates/s; serial 1.76 ms/update at 249.68 updates/s).
+It did not reproduce the visible 388 updates/s case. The high-rate evidence is the
+separate deterministic stress fixture, not that slower headless run.
+
+The root command `bun bevy-benchmark/run.mjs --meshes 100 --workers 8 --cpu-work 1`
+automatically captures and reports sampled application CPU in both cases; no
+separate profile-analysis command is needed. `cpu_execution` weights each OS
+thread CPU delta by whether its sampled raw Gecko stack contains Wasm, reusing
+the shared stack classifier. Console summaries report sampled main, workers and
+total CPU milliseconds per update, stack coverage and other/unclassified CPU.
+This is sampled attribution, not exact app-only execution. Synchronous browser
+callees with Wasm ancestors are included; JS-only and asynchronous work are not.
+The isolated benchmark process is assumed to contain only the benchmark Wasm.
+Missing per-thread stacks or no identifiable Wasm samples report unavailable,
+not a misleading application zero. Partial missing stacks remain explicitly
+unclassified, with sample counts and missing-stack CPU retained in coverage.
+
+The separately named `browser_thread_cpu` diagnostic
+identifies the content process by its own readiness-gated
+`benchmark-cpu-start`/`benchmark-cpu-end` markers, emitted from the measurement
+system before final verification. Readiness loss resets the window. Browser-parent,
+compositor and unrelated-process CPU are excluded. CPU deltas are converted using
+the profile's declared units, never from frame durations or `performance.now()`.
+The latter still controls cadence and warmup, not CPU execution accounting.
+
+Full browser-thread diagnostics and GPU sample coverage remain in saved JSON.
+The console table reports GPU milliseconds separately from sampled CPU milliseconds. Browser-thread diagnostics include
+GeckoMain CPU, summed DOM-worker CPU, their total, and each divided
+by the measured update count. This is an aggregate CPU-per-update mean, not
+per-update latency or percentiles, and includes browser/JS/Wasm work on those
+threads—not isolated Wasm CPU or all browser CPU. Rendering/driver work executed
+on these threads and profiling effects are not subtracted; profiler work on other
+threads is not included. No unprofiled control establishes the overhead magnitude.
+All captured DOM workers in the
+marked process are included, not just compute workers. Thread PID/TID, CPU totals,
+covered intervals and sample counts are retained.
+
+Only sample intervals fully enclosed in the marked window are summed. Crossing
+intervals are omitted without wall-time interpolation: totals are lower bounds,
+with an aggregate boundary CPU upper bound in milliseconds (at most one CPU per
+thread). Missing units, CPU deltas, worker coverage, ambiguous markers or incomplete
+window coverage, duplicate thread IDs or non-increasing sample times produce `supported: false` and an explicit reason, never a proxy.
+Profiling adds overhead to both cases; these FPS results are profiled diagnostics,
+not clean unprofiled comparisons. Actual Firefox delivery remains unverified by
+deterministic tests or Wasm compilation. Readiness, five-second warmup/sample,
+exactly two fresh browsers, materials and the optional CPU workload are unchanged.
+
+This experimental engine extends `RenderDiagnosticsPlugin` with the standard
+wgpu 30 pass-boundary `timestamp_writes` path for WebGPU. The benchmark uses
+`WgpuSettings.optional_features = TIMESTAMP_QUERY` with WebGPU priority and no
+required features. Only adapter-supported optional features are enabled; neither
+`TIMESTAMP_QUERY_INSIDE_ENCODERS` nor `TIMESTAMP_QUERY_INSIDE_PASSES` is requested.
+Unsupported adapters retain CPU/cadence reporting without timestamp queries.
+Native encoder/in-pass diagnostic spans remain available with their existing features.
+
+`gpu_timing` uses `source: "timestamp-query"` and
+`scope: "sum_disjoint_instrumented_passes"`. It sums complete timestamp pairs from
+tracked render passes and the PBR uniform allocation, bin unpacking, early/late
+mesh preprocessing and indirect-parameter compute passes. This is actual GPU
+execution duration of those disjoint passes, **not** submission latency, display
+presentation, CPU duration or a sum of nested diagnostic spans. Copies, gaps,
+raw/uninstrumented passes (including other optional rendering features) and
+explicit caller-owned timestamp writes are excluded. It is not whole-queue GPU
+busy time. Query pairs share the existing recorder allocator, resolve buffers and
+asynchronous map/recycling path. Exhausted-query frames are rejected, not counted
+as deceptively small complete samples. Map errors complete as missing samples.
+
+Each sampled update tags its subsequent render frame before encoding. Delayed,
+out-of-order and duplicate readbacks cannot enter a different measurement window;
+readiness resets discard old tags. After the last sampled update the page drains
+pending results for at most 120 additional updates, outside CPU/cadence sampling.
+`expected_samples` equals measured updates; `samples` counts valid render-frame
+results, and `missing_samples` includes unsupported, exhausted, failed or still
+pending results. Mean and nearest-rank p50/p95 are per **received valid sampled
+render frame**, not divided by all updates when coverage is incomplete. Inspect
+coverage before comparing results. Zero-duration quantized samples are valid;
+zero received samples report `supported: false`, null statistics and a reason.
+No CPU or frame-time proxy is substituted. The CPU reader still reports stale
+artifacts without CPU markers as unavailable. No browser execution was used to
+verify this feature; tests and compilation do not prove live GPU timing delivery.
+`profile.mjs` retains the existing workload/worker CLI options.
+
+Run deterministic CPU accounting and runner checks from the repository root:
+`bun test src/bevy/tools/wasm-render-bench/cpu.test.mjs src/bevy/tools/wasm-render-bench/run.test.mjs src/bevy/tools/wasm-render-bench/capture.test.mjs editor-benchmark/shared_browser.test.mjs`.
+The shared `editor-benchmark/profile.mjs` reader also respects declared CPU units
+and excludes start-crossing intervals; its sampled stack rankings are not exact
+function execution measurements. At exact sample boundaries no interval is omitted.
+Cadence counts intervals between measurement callbacks, not the initial boundary
+callback as another frame. CPU markers are emitted just after the cadence clock
+reads; the reader allows up to 10 ms duration mismatch, so these are not exact
+per-update execution boundaries.
+The earlier wall-span accumulator remains an unused diagnostic source, not default
+instrumentation. The historical wall-span measurements below are not CPU execution
+measurements.
 
 A headless diagnostic with 100 moving meshes and CPU work 1 measured
 PostUpdate 0.362/0.466 ms and Render 7.931/7.981 ms for 2/8 workers

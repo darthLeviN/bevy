@@ -8,6 +8,9 @@
 <pre id="result"></pre>
 <script>
   window.benchmarkConsole = [];
+  if (new URL(location.href).searchParams.get('profile-controlled') === '1') {
+    document.querySelector('#result').setAttribute('data-profile-ready', '0');
+  }
   window.benchmarkFail = error => {
     window.benchmarkFatal = String(error?.stack ?? error);
     const result = document.querySelector('#result');

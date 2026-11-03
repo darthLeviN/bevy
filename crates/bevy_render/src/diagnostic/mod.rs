@@ -28,7 +28,7 @@ use crate::{
 use self::internal::{sync_diagnostics, Pass, RenderDiagnosticsMutex, WriteTimestamp};
 pub use self::{
     erased_render_asset_diagnostic_plugin::ErasedRenderAssetDiagnosticPlugin,
-    internal::DiagnosticsRecorder, mesh_allocator_diagnostic_plugin::MeshAllocatorDiagnosticPlugin,
+    internal::{DiagnosticsRecorder, GpuFrameTiming}, mesh_allocator_diagnostic_plugin::MeshAllocatorDiagnosticPlugin,
     render_asset_diagnostic_plugin::RenderAssetDiagnosticPlugin,
 };
 
@@ -58,19 +58,23 @@ use crate::renderer::RenderDevice;
 ///     ```
 ///
 /// # Supported platforms
-/// Timestamp queries and pipeline statistics are currently supported only on Vulkan and DX12.
-/// On other platforms (Metal, WebGPU, WebGL2) only CPU time will be recorded.
+/// Pass-boundary timestamps require the optional `TIMESTAMP_QUERY` device feature,
+/// including on WebGPU. Tracked render passes and `RenderContext::begin_compute_pass`
+/// use this path. Arbitrary encoder/in-pass spans still require their respective
+/// native-only timestamp features. Without these features CPU diagnostics remain available.
 #[derive(Default)]
 pub struct RenderDiagnosticsPlugin;
 
 impl Plugin for RenderDiagnosticsPlugin {
     fn build(&self, app: &mut App) {
         let render_diagnostics_mutex = RenderDiagnosticsMutex::default();
+        let gpu_timings = GpuFrameTimings::default();
+        app.insert_resource(gpu_timings.clone());
         app.insert_resource(render_diagnostics_mutex.clone())
             .add_systems(PreUpdate, sync_diagnostics);
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.insert_resource(render_diagnostics_mutex);
+            render_app.insert_resource(render_diagnostics_mutex).insert_resource(gpu_timings);
         }
     }
 
@@ -128,11 +132,27 @@ fn finish_diagnostics_frame(
     mut recorder: ResMut<DiagnosticsRecorder>,
     render_device: Res<RenderDevice>,
     mutex: Res<RenderDiagnosticsMutex>,
+    gpu_timings: Res<GpuFrameTimings>,
 ) {
+    let gpu_timings = gpu_timings.clone();
     let mutex = mutex.0.clone();
     recorder.finish_frame(&render_device, move |diagnostics| {
+        let mut pending = gpu_timings.0.lock().unwrap();
+        if pending.len() == 256 { pending.pop_front(); }
+        pending.push_back(diagnostics.gpu.clone());
         *mutex.lock().unwrap() = Some(diagnostics);
     });
+}
+
+/// Completed asynchronous pass timings. Drain regularly; retains at most 256 frames.
+/// Frame tags are captured during encoding, never assigned at readback time.
+#[derive(bevy_ecs::resource::Resource, Clone, Default)]
+pub struct GpuFrameTimings(Arc<std::sync::Mutex<alloc::collections::VecDeque<GpuFrameTiming>>>);
+
+impl GpuFrameTimings {
+    pub fn drain(&self) -> Vec<GpuFrameTiming> {
+        self.0.lock().unwrap().drain(..).collect()
+    }
 }
 
 /// Allows recording diagnostic spans.

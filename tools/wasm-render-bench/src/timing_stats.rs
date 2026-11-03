@@ -4,6 +4,7 @@ pub struct Stats {
     start: Option<f64>,
     pub calls: usize,
     pub milliseconds: f64,
+    samples: Vec<f64>,
 }
 
 impl Stats {
@@ -11,17 +12,47 @@ impl Stats {
 
     pub fn end(&mut self, now: f64) {
         if let Some(start) = self.start.take() {
-            self.calls += 1;
-            self.milliseconds += now - start;
+            self.record(now - start);
         }
     }
 
-    pub fn reset(&mut self) { *self = Self::default(); }
+    pub fn record(&mut self, milliseconds: f64) {
+        if !milliseconds.is_finite() || milliseconds < 0.0 { return; }
+        self.calls += 1;
+        self.milliseconds += milliseconds;
+        self.samples.push(milliseconds);
+    }
+
+    pub fn percentiles(&self) -> (f64, f64) {
+        if self.samples.is_empty() { return (0.0, 0.0); }
+        let mut sorted = self.samples.clone();
+        sorted.sort_by(f64::total_cmp);
+        let percentile = |p: f64| sorted[((sorted.len() as f64 * p).ceil() as usize).saturating_sub(1)];
+        (percentile(0.5), percentile(0.95))
+    }
+
+    pub fn reset(&mut self) {
+        self.start = None;
+        self.calls = 0;
+        self.milliseconds = 0.0;
+        self.samples.clear();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregation_rejects_invalid_values_and_uses_nearest_rank_percentiles() {
+        let mut stats = Stats::default();
+        for value in [4.0, 1.0, 3.0, 2.0, f64::NAN, -1.0, f64::INFINITY] { stats.record(value); }
+        assert_eq!(stats.calls, 4);
+        assert_eq!(stats.milliseconds / stats.calls as f64, 2.5);
+        assert_eq!(stats.percentiles(), (2.0, 4.0));
+        stats.reset();
+        assert_eq!(stats.percentiles(), (0.0, 0.0));
+    }
 
     #[test]
     fn counts_only_completed_spans_and_reset_discards_warmup() {

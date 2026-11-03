@@ -633,8 +633,7 @@ pub fn allocate_uniforms(
         return;
     };
 
-    let command_encoder = render_context.command_encoder();
-    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
+    let mut compute_pass = render_context.begin_compute_pass(&ComputePassDescriptor {
         label: Some("uniform allocation"),
         timestamp_writes: None,
     });
@@ -724,8 +723,7 @@ pub fn unpack_bins(
     let diagnostics = render_context.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
-    let command_encoder = render_context.command_encoder();
-    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
+    let mut compute_pass = render_context.begin_compute_pass(&ComputePassDescriptor {
         label: Some("bin unpacking"),
         timestamp_writes: None,
     });
@@ -808,9 +806,7 @@ pub fn early_gpu_preprocess(
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
-    let command_encoder = ctx.command_encoder();
-
-    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
+    let mut compute_pass = ctx.begin_compute_pass(&ComputePassDescriptor {
         label: Some("early_mesh_preprocessing"),
         timestamp_writes: None,
     });
@@ -1039,9 +1035,7 @@ pub fn late_gpu_preprocess(
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
-    let command_encoder = ctx.command_encoder();
-
-    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
+    let mut compute_pass = ctx.begin_compute_pass(&ComputePassDescriptor {
         label: Some("late_mesh_preprocessing"),
         timestamp_writes: None,
     });
@@ -1238,9 +1232,7 @@ pub(crate) fn run_build_indirect_parameters(
         return;
     };
 
-    let command_encoder = ctx.command_encoder();
-
-    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
+    let mut compute_pass = ctx.begin_compute_pass(&ComputePassDescriptor {
         label: Some(label),
         timestamp_writes: None,
     });

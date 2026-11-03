@@ -13,6 +13,10 @@ use crate::renderer::{RenderDevice, RenderQueue};
 /// This lets tests exercise real `wgpu` resource creation without requiring a
 /// GPU adapter, so they can run in headless environments.
 pub fn create_dummy_device() -> (RenderDevice, RenderQueue) {
+    create_dummy_device_with_features(wgpu::Features::empty())
+}
+
+pub fn create_dummy_device_with_features(features: wgpu::Features) -> (RenderDevice, RenderQueue) {
     let instance = Instance::new(InstanceDescriptor {
         backends: Backends::NOOP,
         flags: InstanceFlags::default(),
@@ -31,6 +35,7 @@ pub fn create_dummy_device() -> (RenderDevice, RenderQueue) {
         .expect("the noop backend should always produce an adapter");
     let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor {
         required_limits: adapter.limits(),
+        required_features: features,
         ..Default::default()
     }))
     .expect("the noop backend should always produce a device");

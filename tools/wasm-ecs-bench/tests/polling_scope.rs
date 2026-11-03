@@ -57,7 +57,9 @@ fn polling_drives_each_executor_and_repolls_pending_tasks_on_the_owner() {
     }
     let results = async move {
         let mut values = Vec::new();
-        for task in tasks { values.push(task.await); }
+        for task in tasks {
+            values.push(polling_scope::wait_for_task(task, |task| task.is_finished()).await);
+        }
         values
     };
     let mut ticks = 0;
@@ -86,7 +88,8 @@ fn ready_results_do_not_tick_and_task_panics_reach_results() {
     let task = executor.spawn(std::panic::AssertUnwindSafe(async {
         panic!("scoped task panic");
     }).catch_unwind());
-    let mut driver = pin!(polling_scope::execute(task, || { ticker.try_tick(); }));
+    let result = polling_scope::wait_for_task(task, |task| task.is_finished());
+    let mut driver = pin!(polling_scope::execute(result, || { ticker.try_tick(); }));
     for _ in 0..4 {
         if let Poll::Ready(result) = driver.as_mut().poll(&mut cx) {
             assert!(result.is_err());
@@ -94,4 +97,63 @@ fn ready_results_do_not_tick_and_task_panics_reach_results() {
         }
     }
     panic!("task panic was not returned to the scope collector");
+}
+
+#[test]
+fn unfinished_results_are_not_polled_or_registered_for_wakeup() {
+    struct ResultFuture {
+        polls: Arc<AtomicUsize>,
+        finished: Arc<AtomicUsize>,
+    }
+    impl Future for ResultFuture {
+        type Output = usize;
+        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            cx.waker().wake_by_ref();
+            Poll::Ready(42)
+        }
+    }
+    let polls = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let future = ResultFuture { polls: polls.clone(), finished: finished.clone() };
+    let mut result = pin!(polling_scope::wait_for_task(future, |task| {
+        task.finished.load(Ordering::Acquire) != 0
+    }));
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    for _ in 0..1000 {
+        assert!(result.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(polls.load(Ordering::Relaxed), 0);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    finished.store(1, Ordering::Release);
+    assert_eq!(result.as_mut().poll(&mut cx), Poll::Ready(42));
+    assert_eq!(polls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn completed_results_do_not_notify_the_polling_collector() {
+    let executor = ThreadExecutor::new();
+    let ticker = executor.ticker().unwrap();
+    let task = executor.spawn(async { 7 }).fallible();
+    let mut result = pin!(polling_scope::wait_for_task(task, |task| task.is_finished()));
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(result.as_mut().poll(&mut cx).is_pending());
+    assert!(ticker.try_tick());
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    assert_eq!(result.as_mut().poll(&mut cx), Poll::Ready(Some(7)));
+}
+
+#[test]
+fn dropped_runnable_returns_none_instead_of_spinning_forever() {
+    let executor = ThreadExecutor::new();
+    let task = executor.spawn(core::future::pending::<()>()).fallible();
+    let mut result = pin!(polling_scope::wait_for_task(task, |task| task.is_finished()));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(result.as_mut().poll(&mut cx).is_pending());
+    drop(executor);
+    assert_eq!(result.as_mut().poll(&mut cx), Poll::Ready(None));
 }

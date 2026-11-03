@@ -1,7 +1,7 @@
-//! Opt-in schedule wall-time diagnostics; no changes to executor or workload policy.
+//! Scoped CPU wall-time diagnostics; no changes to executor or workload policy.
 use bevy::{app::{MainScheduleOrder, SubApp}, ecs::schedule::ScheduleLabel, prelude::*, render::{RenderApp, RenderScheduleOrder}};
 use bevy::platform::time::Instant;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use crate::timing_stats::Stats;
 
 fn now() -> f64 {
@@ -20,9 +20,11 @@ struct Entry {
 }
 
 #[derive(Resource, Clone, Default)]
-pub struct Timings(Arc<Mutex<Vec<Entry>>>);
+pub struct Timings(Arc<Mutex<Vec<Entry>>>, Arc<AtomicBool>);
 
 impl Timings {
+    pub fn collecting(&self, enabled: bool) { self.1.store(enabled, Ordering::Relaxed); }
+
     pub fn reset(&self) {
         for entry in self.0.lock().unwrap().iter_mut() {
             entry.stats.reset();
@@ -32,7 +34,8 @@ impl Timings {
     pub fn json(&self) -> String {
         let entries = self.0.lock().unwrap();
         let rows: Vec<_> = entries.iter().filter(|entry| entry.stats.calls > 0).map(|entry| {
-            format!(r#"{{"schedule":"{}","calls":{},"mean_ms":{}}}"#,
+            let (p50, p95) = entry.stats.percentiles();
+            format!(r#"{{"schedule":"{}","calls":{},"mean_ms":{},"p50_ms":{p50},"p95_ms":{p95}}}"#,
                 entry.name, entry.stats.calls, entry.stats.milliseconds / entry.stats.calls as f64)
         }).collect();
         format!("[{}]", rows.join(","))
@@ -61,9 +64,10 @@ pub fn install(app: &mut App) {
         let index = timings.0.lock().unwrap().len();
         timings.0.lock().unwrap().push(Entry { name: "render:extract_callback".into(), ..default() });
         render.set_extract(move |main, sub| {
-            timings.0.lock().unwrap()[index].stats.begin(now());
+            let collecting = timings.1.load(Ordering::Relaxed);
+            if collecting { timings.0.lock().unwrap()[index].stats.begin(now()); }
             extract(main, sub);
-            timings.0.lock().unwrap()[index].stats.end(now());
+            if collecting { timings.0.lock().unwrap()[index].stats.end(now()); }
         });
     }
 }
@@ -79,12 +83,13 @@ fn instrument(app: &mut SubApp, timings: &Timings, name: String) -> usize {
     let end = timings.clone();
     let mut before = Schedule::new(Boundary(index, false));
     before.set_executor(bevy::ecs::schedule::SingleThreadedExecutor::new());
-    before.add_systems(move || start.0.lock().unwrap()[index].stats.begin(now()));
+    before.add_systems(move || {
+        if start.1.load(Ordering::Relaxed) { start.0.lock().unwrap()[index].stats.begin(now()); }
+    });
     let mut after = Schedule::new(Boundary(index, true));
     after.set_executor(bevy::ecs::schedule::SingleThreadedExecutor::new());
     after.add_systems(move || {
-        let now = now();
-        end.0.lock().unwrap()[index].stats.end(now);
+        if end.1.load(Ordering::Relaxed) { end.0.lock().unwrap()[index].stats.end(now()); }
     });
     app.add_schedule(before);
     app.add_schedule(after);
