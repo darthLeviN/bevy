@@ -1678,7 +1678,11 @@ where
             material_param,
         ): &mut SystemParamItem<Self::Param>,
     ) -> Result<Self::ErasedAsset, PrepareAssetError<Self::SourceAsset>> {
-        let material_layout = M::bind_group_layout_descriptor(render_device);
+        let material_layout = bind_group_allocators
+            .get(&TypeId::of::<M>())
+            .unwrap()
+            .bind_group_layout()
+            .clone();
 
         let binding = render_material_bindings.prepare_material(
             &material,

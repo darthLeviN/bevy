@@ -4,6 +4,10 @@
 //! allocator manages each bind group, assigning slots to materials as
 //! appropriate.
 
+#[path = "material_uniform_pages.rs"]
+mod material_uniform_pages;
+use material_uniform_pages::{UniformPages, UniformSlot};
+
 use bevy_app::{App, Plugin};
 use bevy_asset::{Asset, AssetId, Handle, UntypedAssetId};
 use bevy_derive::{Deref, DerefMut};
@@ -222,6 +226,8 @@ where
 
 /// The allocator that stores bind groups for non-bindless materials.
 pub struct MaterialBindGroupNonBindlessAllocator {
+    /// The material type's layout, resolved for this allocator's render device.
+    bind_group_layout: BindGroupLayoutDescriptor,
     /// The label of the bind group allocator to use for allocated buffers.
     label: &'static str,
     /// A mapping from [`MaterialBindGroupIndex`] to the bind group allocated in
@@ -236,6 +242,7 @@ pub struct MaterialBindGroupNonBindlessAllocator {
     free_indices: Vec<MaterialBindGroupIndex>,
     /// Prepared groups whose retained uniform bytes need uploading.
     dirty_uniforms: HashSet<MaterialBindGroupIndex>,
+    uniform_pages: UniformPages<Buffer>,
 }
 
 /// A single bind group that a [`MaterialBindGroupNonBindlessAllocator`] is
@@ -265,7 +272,7 @@ enum MaterialNonBindlessAllocatedBindGroup {
         layout: BindGroupLayoutDescriptor,
         /// Uniform buffers referenced by the bind group.
 
-        uniform_buffers: Vec<Buffer>,
+        uniform_buffers: Vec<UniformSlot>,
     },
 }
 
@@ -577,8 +584,17 @@ impl MaterialBindGroupAllocator {
             )))
         } else {
             MaterialBindGroupAllocator::NonBindless(Box::new(
-                MaterialBindGroupNonBindlessAllocator::new(label),
+                MaterialBindGroupNonBindlessAllocator::new(label, bind_group_layout),
             ))
+        }
+    }
+
+    /// Returns the material layout resolved when this allocator was created.
+    /// Replacing the allocator for a new device also replaces this descriptor.
+    pub fn bind_group_layout(&self) -> &BindGroupLayoutDescriptor {
+        match self {
+            Self::Bindless(allocator) => &allocator.bind_group_layout,
+            Self::NonBindless(allocator) => &allocator.bind_group_layout,
         }
     }
 
@@ -2399,13 +2415,18 @@ fn update_non_bindless_data(
 impl MaterialBindGroupNonBindlessAllocator {
     /// Creates a new [`MaterialBindGroupNonBindlessAllocator`] managing the
     /// bind groups for a single non-bindless material.
-    fn new(label: &'static str) -> MaterialBindGroupNonBindlessAllocator {
+    fn new(
+        label: &'static str,
+        bind_group_layout: BindGroupLayoutDescriptor,
+    ) -> MaterialBindGroupNonBindlessAllocator {
         MaterialBindGroupNonBindlessAllocator {
+            bind_group_layout,
             label,
             bind_groups: vec![],
             to_prepare: HashSet::default(),
             free_indices: vec![],
             dirty_uniforms: HashSet::default(),
+            uniform_pages: UniformPages::default(),
         }
     }
 
@@ -2442,10 +2463,11 @@ impl MaterialBindGroupNonBindlessAllocator {
             let mut buffers = uniform_buffers.iter();
             for (_, resource) in bind_group.bindings.iter() {
                 if let OwnedBindingResource::Data(data) = resource {
-                    queue.write_buffer(buffers.next().unwrap(), 0, &data.0);
+                    self.uniform_pages.update(*buffers.next().unwrap(), &data.0);
                 }
             }
         }
+        self.uniform_pages.upload(|buffer, offset, bytes| queue.write_buffer(buffer, offset, bytes));
     }
 
     /// Inserts a bind group, either unprepared or prepared, into this allocator
@@ -2516,7 +2538,11 @@ impl MaterialBindGroupNonBindlessAllocator {
     fn free(&mut self, binding_id: MaterialBindingId) {
         debug_assert_eq!(binding_id.slot, MaterialBindGroupSlot(0));
         debug_assert!(self.bind_groups[*binding_id.group as usize].is_some());
-        self.bind_groups[*binding_id.group as usize] = None;
+        if let Some(MaterialNonBindlessAllocatedBindGroup::Prepared { uniform_buffers, .. }) =
+            self.bind_groups[*binding_id.group as usize].take()
+        {
+            for slot in uniform_buffers { self.uniform_pages.free(slot); }
+        }
         self.to_prepare.remove(&binding_id.group);
         self.dirty_uniforms.remove(&binding_id.group);
         self.free_indices.push(binding_id.group);
@@ -2563,17 +2589,23 @@ impl MaterialBindGroupNonBindlessAllocator {
 
             // Pack any `Data` into uniform buffers.
             let mut uniform_buffers = vec![];
-            for (index, binding) in unprepared_bind_group.binding_resources.iter() {
+            for (_, binding) in unprepared_bind_group.binding_resources.iter() {
                 let UnpreparedBindingResource::Data(ref data_range) = *binding else {
                     continue;
                 };
-                let label = format!("material uniform data {}", *index);
-                let uniform_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
-                    label: Some(&label),
-                    contents: &unprepared_bind_group.data_buffer
-                        [(data_range.start as usize)..(data_range.end as usize)],
-                    usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
-                });
+                let limits = render_device.limits();
+                let uniform_buffer = self.uniform_pages.allocate(
+                    &unprepared_bind_group.data_buffer[data_range.start as usize..data_range.end as usize],
+                    limits.min_uniform_buffer_offset_alignment,
+                    limits.max_uniform_buffer_binding_size,
+                    limits.max_buffer_size,
+                    |size| render_device.create_buffer(&BufferDescriptor {
+                        label: Some("material uniform page"),
+                        size,
+                        usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
+                        mapped_at_creation: false,
+                    }),
+                );
                 uniform_buffers.push(uniform_buffer);
             }
 
@@ -2585,10 +2617,14 @@ impl MaterialBindGroupNonBindlessAllocator {
                     UnpreparedBindingResource::Data(_) => {
                         bind_group_entries.push(BindGroupEntry {
                             binding: *index,
-                            resource: uniform_buffers_iter
-                                .next()
-                                .expect("We should have created uniform buffers for each `Data`")
-                                .as_entire_binding(),
+                            resource: {
+                                let slot = *uniform_buffers_iter.next().expect("uniform slot for each Data");
+                                BindingResource::Buffer(BufferBinding {
+                                    buffer: self.uniform_pages.buffer(slot),
+                                    offset: slot.offset,
+                                    size: core::num::NonZeroU64::new(slot.size),
+                                })
+                            },
                         });
                     }
                     _ => bind_group_entries.push(BindGroupEntry {
@@ -2639,7 +2675,7 @@ impl MaterialBindGroupNonBindlessAllocator {
             let Some(MaterialNonBindlessAllocatedBindGroup::Prepared {
                 bind_group: ref mut prepared_bind_group,
                 ref mut layout,
-                ..
+                ref mut uniform_buffers,
             }) = *maybe_allocated_bind_group
             else {
                 continue;
@@ -2665,6 +2701,8 @@ impl MaterialBindGroupNonBindlessAllocator {
             // will detect that the bind group is now unprepared and will
             // rebuild it.
             let layout = mem::take(layout);
+            for slot in uniform_buffers.drain(..) { self.uniform_pages.free(slot); }
+            self.dirty_uniforms.remove(&MaterialBindGroupIndex(allocated_bind_group_index as u32));
             *maybe_allocated_bind_group = Some(MaterialNonBindlessAllocatedBindGroup::Unprepared {
                 bind_group: prepared_bind_group.unprepare(),
                 layout,
@@ -2965,24 +3003,28 @@ mod tests {
             }],
         };
         let actual_layout = device.create_bind_group_layout("reuse test", &layout.entries);
-        let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
-            label: None,
-            contents: &[1; 16],
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        let mut allocator = MaterialBindGroupNonBindlessAllocator::new("reuse test", layout.clone());
+        let slot = allocator.uniform_pages.allocate(&[1; 16], 256, 65536, 65536, |size| {
+            device.create_buffer(&BufferDescriptor {
+                label: None, size, mapped_at_creation: false,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            })
         });
+        let buffer = allocator.uniform_pages.buffer(slot);
         let group = device.create_bind_group("reuse test", &actual_layout, &[
-            BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },
+            BindGroupEntry { binding: 0, resource: BindingResource::Buffer(BufferBinding {
+                            buffer, offset: slot.offset, size: core::num::NonZeroU64::new(slot.size),
+                        }) },
         ]);
         let group_id = group.id();
         let buffer_id = buffer.id();
-        let mut allocator = MaterialBindGroupNonBindlessAllocator::new("reuse test");
         let binding = allocator.allocate(MaterialNonBindlessAllocatedBindGroup::Prepared {
             bind_group: PreparedBindGroup {
                 bind_group: group,
                 bindings: BindingResources(vec![(0, OwnedBindingResource::Data(OwnedData(vec![1; 16])))]),
             },
             layout: layout.clone(),
-            uniform_buffers: vec![buffer],
+            uniform_buffers: vec![slot],
         });
         let builder = BindGroupBuilder {
             binding_resources: UnpreparedBindingResources(vec![(0, UnpreparedBindingResource::Data(0..16))]),
@@ -2993,7 +3035,7 @@ mod tests {
         assert!(allocator.dirty_uniforms.is_empty());
         let Some(MaterialNonBindlessAllocatedBindGroup::Prepared { bind_group, uniform_buffers, .. }) = &allocator.bind_groups[0] else { unreachable!() };
         assert_eq!(bind_group.bind_group.id(), group_id);
-        assert_eq!(uniform_buffers[0].id(), buffer_id);
+        assert_eq!(allocator.uniform_pages.buffer(uniform_buffers[0]).id(), buffer_id);
         let mut changed_layout = layout.clone();
         changed_layout.entries[0].visibility = wgpu::ShaderStages::VERTEX;
         assert!(!allocator.try_update_data(binding, &builder, &changed_layout));
