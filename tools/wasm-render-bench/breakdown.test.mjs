@@ -68,6 +68,22 @@ test('children never steal another broad category or replace an innermost generi
   expect(stackAttribution(unresolved, 1)).toMatchObject({ category: 'render_commands', command: 'queue_submission', unresolved: true });
 });
 
+test('function names retain absolute indexes including imported functions', () => {
+  // One imported function (index 0) and one defined function (index 1).
+  const bytes = Uint8Array.from([
+    0,97,115,109,1,0,0,0,
+    1,4,1,96,0,0,
+    2,7,1,1,109,1,102,0,0,
+    3,2,1,0,
+    10,4,1,2,0,11,
+    0,18,4,110,97,109,101,1,11,2,0,3,105,109,112,1,3,100,101,102,
+  ]);
+  const names = wasmFunctionNames(bytes);
+  expect(names.get(0)).toBe('imp');
+  expect(names.get(1)).toBe('def');
+  expect(names.has(2)).toBe(false);
+});
+
 test('reads function indexes from Wasm custom name section without executing module', () => {
   const bytes = Uint8Array.from([0,97,115,109,1,0,0,0,0,13,4,110,97,109,101,1,6,1,7,3,102,111,111]);
   expect(wasmFunctionNames(bytes).get(7)).toBe('foo');

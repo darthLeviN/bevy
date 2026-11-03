@@ -19,6 +19,8 @@ wgpu_wrapper! {
 #[derive(Resource, Clone)]
 pub struct RenderDevice {
     device: WgpuDevice,
+    features: wgpu::Features,
+    limits: wgpu::Limits,
 }
 
 impl From<wgpu::Device> for RenderDevice {
@@ -29,8 +31,14 @@ impl From<wgpu::Device> for RenderDevice {
 
 impl RenderDevice {
     pub fn new(device: wgpu::Device) -> Self {
+        // Device capabilities are immutable. WebGPU queries otherwise repeatedly
+        // convert JS feature strings and limits during material preparation.
+        let features = device.features();
+        let limits = device.limits();
         Self {
             device: WgpuDevice::new(device),
+            features,
+            limits,
         }
     }
 
@@ -39,7 +47,7 @@ impl RenderDevice {
     /// Functions may panic if you use unsupported features.
     #[inline]
     pub fn features(&self) -> wgpu::Features {
-        self.device.features()
+        self.features
     }
 
     /// List all [`Limits`](wgpu::Limits) that were requested of this device.
@@ -47,7 +55,7 @@ impl RenderDevice {
     /// If any of these limits are exceeded, functions may panic.
     #[inline]
     pub fn limits(&self) -> wgpu::Limits {
-        self.device.limits()
+        self.limits.clone()
     }
 
     /// Creates a [`ShaderModule`](wgpu::ShaderModule) from either SPIR-V or WGSL source code.
@@ -310,6 +318,27 @@ impl RenderDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_are_preserved_per_device_and_clone() {
+        for required_features in [wgpu::Features::empty(), wgpu::Features::TIMESTAMP_QUERY] {
+            let descriptor = wgpu::DeviceDescriptor {
+                required_features,
+                ..Default::default()
+            };
+            let (device, _) = wgpu::Device::noop(&descriptor);
+            let expected_features = device.features();
+            let expected_limits = device.limits();
+            let render_device = RenderDevice::new(device);
+            let cloned = render_device.clone();
+            for _ in 0..1000 {
+                for device in [&render_device, &cloned] {
+                    assert_eq!(device.features(), expected_features);
+                    assert_eq!(device.limits(), expected_limits);
+                }
+            }
+        }
+    }
 
     #[test]
     fn align_copy_bytes_per_row() {

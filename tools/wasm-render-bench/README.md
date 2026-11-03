@@ -337,7 +337,65 @@ backend conversions for 0.1131/0.1170; backend-other for 0.1347/0.1014.
 These are statistical symbol attributions from one profiled run, not exact stage
 latencies or evidence that the threaded/serial differences are significant.
 
-Focused checks: `bun test src/bevy/tools/wasm-render-bench/breakdown.test.mjs src/bevy/tools/wasm-render-bench/cpu.test.mjs src/bevy/tools/wasm-render-bench/run.test.mjs src/bevy/tools/wasm-render-bench/capture.test.mjs`.
+#### Repeated device capability conversion at 1,000 meshes
+
+The saved visible-Firefox `2026-11-03T10-54-41.062Z.json` profile has these
+exclusive conversion-symbol contributors (OS CPU ms/update; samples in parentheses):
+
+| Symbol | Threaded / four workers | Serial |
+| --- | --- | --- |
+| `map_wgt_features` | 35.6516 (299) | 34.1990 (290) |
+| `map_wgt_limits` | 0.3568 (3) | 0.5900 (5) |
+| `map_texture_format` | 0 (0) | 0 (0) |
+
+These stacks already contain Firefox-demangled names, rather than depending on
+raw-index lookup. Native leaves, Wasm exit shims, `passStringToWasm0`, string-get
+and `__wbg_has` JS wrappers sit **inside** `map_wgt_features`, with material
+`bind_group_layout_entries` / `build_bind_group` preparation as callers. The
+category is ancestor-inclusive, not Rust function self-time. Samples are not
+function call counts. This evidence matches installed wgpu 30.0.0's WebGPU
+`DeviceInterface::features`: every query reruns `map_wgt_features`, iterating the
+feature mapping, converting JS strings and querying `GPUSupportedFeatures.has`.
+Limits likewise reread browser properties on every query.
+
+`RenderDevice` now snapshots its device's immutable features and limits in `new`,
+retains them in clones, and returns them without repeating backend queries. It
+caches device capabilities, not the potentially broader adapter capabilities.
+The workload is unchanged: 1,000 moving meshes, 1,001 unique materials, CPU work 1,
+and 32 independent CPU systems with a dependent per-material color update.
+
+After the O3 Wasm rebuild, the authorized two-case **headless** capture
+`2026-11-03T11-01-57.274Z.json` retained that workload and recorded conversion CPU
+of 0 (0 samples) threaded and 0.2044 ms/update (2 samples) serial. Both remaining
+samples come through `Adapter::get_texture_format_features` in mip-generation
+preparation, not the repaired material/device path. Total sampled application CPU
+was 25.25/23.31 ms/update, with 18.82/19.39 updates/s. The baseline was visible,
+so this is not a matched FPS comparison or a precise speedup estimate. Zero
+samples does not prove zero remaining conversion work. The runner completed both
+fresh browser cases and owned cleanup without a runtime timeout.
+
+Offline diagnostic (run from repository root; supply the exact captured Wasm for
+profiles containing raw function indexes):
+
+```sh
+bun src/bevy/tools/wasm-render-bench/contributors.mjs REPORT.json SERVED.wasm
+# Add --full-stacks for all weighted leaf-to-root stacks instead of three excerpts.
+```
+
+The diagnostic preserves raw labels, resolved symbols, OS weights and boundary
+exclusions, and splits the category by its innermost conversion symbol without
+claiming call counts or discarding native/browser leaves. A later rebuilt Wasm
+must not resolve an older profile's raw indexes; the observations above use the
+older profile's already-demangled conversion frames.
+
+The native `RenderDevice` regression test uses wgpu's noop device to check
+capability values across repeated reads, clones and separate devices. Its attempted
+execution was blocked before compilation by the existing engine workspace error:
+`multiple workspace roots found in the same workspace` (the root and standalone
+Wasm benchmarks). That test remains unexecuted; the O3 Wasm build and authorized
+browser capture passed. No workspace repair was included.
+
+Focused checks: `bun test src/bevy/tools/wasm-render-bench/breakdown.test.mjs src/bevy/tools/wasm-render-bench/contributors.test.mjs src/bevy/tools/wasm-render-bench/cpu.test.mjs src/bevy/tools/wasm-render-bench/run.test.mjs src/bevy/tools/wasm-render-bench/capture.test.mjs`.
 They cover realistic captured symbols, raw index resolution, method-name
 collisions, broad-category precedence, per-role parent/child CPU and sample
 conservation, and human-readable hierarchical reporting.
