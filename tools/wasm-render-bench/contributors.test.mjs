@@ -52,6 +52,19 @@ test('creation contributors use exclusive OS weights and retain material callers
   expect(rows[0].stack.at(-1).symbol).toContain('prepare_bind_groups');
 });
 
+test('preparation contributors match the exclusive parent and exclude inner GPU operations', () => {
+  const profile = fixture();
+  profile.threads[0].stringTable[0] = 'wasm_render_bench.wasm.bevy_pbr::mesh::prepare_meshes';
+  profile.threads[0].stringTable[3] = 'wasm_render_bench.wasm.bevy_render::uniform::prepare_uniforms';
+  const rows = conversionContributors(profile, result, new Map(), 'render_preparation');
+  expect(rows).toHaveLength(2);
+  expect(rows[0].stack[0].raw).toBe('native leaf');
+  const parent = cpuAccounting(profile, result).application_cpu.breakdown.rows.find(row => row.id === 'render_preparation');
+  expect(rows.reduce((sum, row) => sum + row.cpu_ms_per_update, 0)).toBe(parent.total_cpu_ms_per_update);
+  profile.threads[0].stringTable[1] = 'wgpu::Device::create_bind_group';
+  expect(conversionContributors(profile, result, new Map(), 'render_preparation')).toHaveLength(1);
+});
+
 test('unavailable accounting is rejected rather than reporting zero conversion CPU', () => {
   expect(() => conversionContributors({}, result, new Map())).toThrow('CPU window');
 });

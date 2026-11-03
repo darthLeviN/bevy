@@ -135,6 +135,123 @@ or launch anything. The direct runner uses the same parser with headless default
 A live command must use current artifacts. A runtime timeout requires stopping
 and reporting, not automatically retrying or extending deadlines.
 
+## Mesh collection / sparse-buffer experiment (2026-11-03)
+
+This focused change skips byte-identical model-space culling-bound writes in both
+collection paths. It preserves signed-zero and NaN payload differences, new-slot
+dirty state, and replacement writes at reused instance indices. Instance transform
+and previous-transform writes remain unconditional. Sparse dirty marking now marks
+a summary bit only on the first clean-to-dirty transition of its 64-element block;
+repeated marking of an already-dirty element avoids another atomic RMW. This relies
+on the existing exclusive upload/drain phase after worker joins, not concurrent
+upload and mutation. No GPU affinity or threading guard was changed.
+
+The GPU-culling steady-state fast path already avoids per-instance channel sends.
+The three channels are created per collection invocation, but new instances and
+layer/culling-mode changes use their slow path. The collection task wrapper also
+contains actual preparation, shared POD writes, and previous-transform history;
+its sampled cost is not purely executor overhead. Those operations, workload,
+unique materials, specialization and pipeline cloning were left unchanged.
+
+The actual CPU helpers can be tested without the enclosing Bevy Cargo workspace:
+
+```sh
+# From src/bevy; output uses the existing benchmark cache.
+rustc --edition=2024 --test crates/bevy_render/src/render_resource/sparse_buffer_dirty.rs -o /home/levi/dev/space-maker/.cache/bevy-web-ecs/sparse-buffer-dirty-tests
+/home/levi/dev/space-maker/.cache/bevy-web-ecs/sparse-buffer-dirty-tests
+```
+
+Four deterministic tests cover byte-exact no-ops and changes, dirty retention,
+concurrent same-bit/shared-word marking, exclusive drains, reused slots, and
+parallel sparse-upload byte equivalence against full copies across 10,001 slots.
+They exercise CPU helpers used by the real buffer; they do not execute GPU scatter
+or the complete renderer's entity-removal/layer-transition systems.
+
+The cached O3 Wasm build and wasm-bindgen generation succeeded. Both before and
+after used the root runner with `--headless --meshes 10000 --workers 4 --cpu-work 1`,
+fresh browsers per case, graphics readiness, at least five seconds of warmup and a
+separate five-second sample. Both reports passed motion/CPU validation with 10,001
+meshes and 10,001 unique materials and retained browser-main GPU ownership.
+
+| Metric | Threaded before | Threaded after | Serial before | Serial after |
+| --- | ---: | ---: | ---: | ---: |
+| Application updates/sec | 6.684 | 6.489 | 6.562 | 6.642 |
+| Sampled render preparation ms/update | 42.75 | 46.60 | 42.55 | 45.19 |
+| Sampled collection + instance/culling + builder ms/update | 12.52 | 14.04 | 13.48 | 13.04 |
+
+Before: repository-root
+`.cache/bevy-web-ecs/render-results/2026-11-03T11-24-16.838Z.json`.
+After: `.cache/bevy-web-ecs/render-results/2026-11-03T11-29-02.992Z.json`.
+Comparison used captured named stack labels, not the rebuilt binary's function
+indices to resolve an older profile. The culling setter no longer appears as a
+separate sampled contributor after the change, but inlining/ancestor attribution
+can move costs. **This pair does not demonstrate an overall speedup or a reliable
+reduction of the complete target group.** Threaded cadence decreased about 2.9%;
+serial increased about 1.2%. Each case contains only 33–34 measured updates and
+10-ms statistical samples. Earlier `11-18-32.298Z` results had substantially higher
+cadence even before this change and are not a matched speedup baseline. Do not
+claim the original roughly 14.4 ms group was eliminated.
+
+## Base material specialization cache-hit experiment (2026-11-03)
+
+Captured named stacks establish a separate source of repeated preparation work:
+`specialize_material_meshes` → `base_specialize` → `World::resource_scope` →
+`MeshLayouts::clone`, including allocator, memory-copy and layout destruction
+frames. This is not collection-task wrapper overhead. The base specialization
+path cloned the entire `MeshPipeline` before `SpecializedMeshPipelines::specialize`
+could discover an existing key/layout entry. Animated material preparation can
+revisit specialization without requiring a new GPU pipeline. The prepass path
+already checks `get_pipeline` before constructing its owned specializer.
+
+`base_specialize` now performs that same read-only lookup first. Hits bypass the
+resource scope, pipeline/layout clone and property reference clone; misses retain
+the original implementation. There is no additional cache, retained world/device
+resource or changed invalidation policy: every lookup reads the current
+`SpecializedMeshPipelines<MaterialPipelineSpecializer>` resource. All preceding
+mesh/culling/sparse-buffer experiments remain in place. Workload, materials,
+systems, worker counts and browser-main GPU ownership are unchanged.
+
+Run `bun test src/bevy/tools/wasm-render-bench/specialization.test.mjs` from the
+repository root. It compiles the actual `base_specialize` source body with
+GPU/ECS resource fakes and runs four Rust tests: 10,001 hits without pipeline
+resources or slow-path calls; cold misses and distinct keys/layouts; cache-resource
+replacement/invalidation; and repeated errors with no cached success. Reference
+counts check temporary pipeline/property ownership is released. These tests check
+actual function routing with fake resources, **not** real GPU pipeline creation,
+Bevy resource-scope internals or the real cache's hashing/equality implementation.
+They run independently of the enclosing workspace's nested-tools Cargo issue.
+The cached O3 Wasm build and wasm-bindgen generation also passed.
+
+A fresh bounded headless before/after pair used `--meshes 10000 --workers 4
+--cpu-work 1`, exactly two fresh browsers per run, readiness-gated warmup and a
+separate five-second sample, with owned cleanup. Reports:
+
+- Before: `.cache/bevy-web-ecs/render-results/2026-11-03T11-34-16.636Z.json`.
+- After: `.cache/bevy-web-ecs/render-results/2026-11-03T11-37-20.570Z.json`.
+
+| Metric | Threaded before | Threaded after | Serial before | Serial after |
+| --- | ---: | ---: | ---: | ---: |
+| Application updates/sec | 6.529 | 8.383 | 6.953 | 8.628 |
+| Sampled render preparation ms/update | 42.20 | 39.71 | 42.53 | 43.19 |
+| Sampled asset/material preparation ms/update | 14.16 | 11.70 | 14.35 | 11.00 |
+| Sampled CPU with named `base_specialize` ancestor ms/update | 4.79 | 0.00 | 4.48 | 0.45 |
+| Measured updates | 33 | 43 | 35 | 44 |
+
+The ancestor row combines exclusive contributors from preparation, asset/material,
+queue/sort and command categories, without double-counting. Before had 16 samples
+per case; after had 0/2. Layout clone/drop contributors disappeared from the after
+capture. Comparisons used captured named labels, not the rebuilt binary's indices
+for the older profile. All cases verified motion/CPU work, 10,001 meshes and unique
+materials, requested workers, and complete GPU timing coverage (about 0.113 ms).
+
+Cadence improved 28.4% threaded and 24.1% serial in this pair. This is one profiled
+pair, not a repeated median/range or proof that the full cadence gain comes from
+cloning. Sampling/inlining can move category attribution, and zero samples do not
+prove zero CPU. In particular, **the broad preparation category remains large and
+serial preparation did not improve**. This identifies and removes confirmed
+avoidable specialization work; it does not establish that mesh collection, material
+uploads or the entire roughly 40-ms preparation category have been fixed.
+
 ## Current result and repair boundary
 
 The results below used the earlier shared-browser/fresh-document strategy. An

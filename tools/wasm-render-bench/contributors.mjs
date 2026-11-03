@@ -2,12 +2,13 @@ import { readFileSync } from 'node:fs';
 
 import { processes, cpuMillisecondsPerUnit } from '../../../../editor-benchmark/profile.mjs';
 import { cpuAccounting } from './cpu.mjs';
-import { stackAttribution, commandCategory, wasmFunctionNames } from './breakdown.mjs';
+import { stackAttribution, commandCategory, categories, wasmFunctionNames } from './breakdown.mjs';
 
 // Preserve complete leaf-to-root evidence: an attributed ancestor is not self CPU.
 export function conversionContributors(profile, result, names, category = 'backend_conversion') {
   const accounting = cpuAccounting(profile, result, names);
   if (!accounting.supported) throw Error(accounting.reason);
+  const topLevel = categories.find(([id]) => id === category);
   const rows = new Map();
   for (const process of processes(profile)) for (const thread of process.threads ?? []) {
     if (!accounting.threads.some(t => t.pid === thread.pid && t.tid === thread.tid)) continue;
@@ -17,7 +18,7 @@ export function conversionContributors(profile, result, names, category = 'backe
     for (const sample of thread.samples.data) {
       const time = sample[schema.time];
       if (previous >= accounting.start_ms && time <= accounting.end_ms &&
-          stackAttribution(thread, sample[schema.stack], names).command === category) {
+          stackAttribution(thread, sample[schema.stack], names)[topLevel ? 'category' : 'command'] === category) {
         const labels = [], seen = new Set();
         let stack = sample[schema.stack];
         while (stack != null && !seen.has(stack)) {
@@ -31,7 +32,7 @@ export function conversionContributors(profile, result, names, category = 'backe
           stack = row[thread.stackTable.schema.prefix];
         }
         const key = JSON.stringify([thread.tid, labels]);
-        const symbol = labels.find(frame => commandCategory(frame.symbol) === category)?.symbol;
+        const symbol = labels.find(frame => topLevel ? topLevel[2].test(frame.symbol) : commandCategory(frame.symbol) === category)?.symbol;
                 const entry = rows.get(key) ?? { tid: thread.tid, name: thread.name, symbol, samples: 0, cpu_ms: 0, stack: labels };
         entry.samples++;
         entry.cpu_ms += sample[schema.threadCPUDelta] * unit;
