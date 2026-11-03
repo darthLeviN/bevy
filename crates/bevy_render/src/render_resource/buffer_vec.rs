@@ -351,6 +351,11 @@ where
         index as u32
     }
 
+    /// Starts an exclusive payload phase, preventing shared atomic access and uploads.
+    pub fn exclusive_payload(&mut self) -> super::ExclusivePayload<'_, T> {
+        super::ExclusivePayload::new(&mut self.values)
+    }
+
     /// Copies a value out of the buffer.
     pub fn get(&self, index: u32) -> T {
         T::read_from_blob(&self.values[index as usize])

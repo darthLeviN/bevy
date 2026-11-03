@@ -1,4 +1,6 @@
 mod atomic_pod;
+mod exclusive_payload;
+pub use exclusive_payload::*;
 mod batched_uniform_buffer;
 mod bind_group;
 mod bind_group_entries;

@@ -354,6 +354,11 @@ where
         &self.buffer
     }
 
+    /// Exclusive collector phase; the free list remains inaccessible to workers.
+    pub fn exclusive_payload(&mut self) -> (crate::render_resource::ExclusivePayload<'_, BDI>, &[core::sync::atomic::AtomicU64], &[core::sync::atomic::AtomicU64]) {
+        self.buffer.exclusive_payload()
+    }
+
     /// Adds a new piece of buffered data to the uniform buffer and returns its
     /// index.
     pub fn add(&mut self, element: BDI) -> u32 {
@@ -502,6 +507,11 @@ where
     pub fn reserve(&mut self, capacity: u32) {
         self.buffer.grow(capacity);
         *self.atomic_len.get_mut() = 0;
+    }
+
+    /// Borrows history storage and its atomic reservation counter for the collector.
+    pub fn exclusive_payload(&mut self) -> (crate::render_resource::ExclusivePayload<'_, BPDI>, &AtomicU32) {
+        (self.buffer.exclusive_payload(), &self.atomic_len)
     }
 
     /// Appends a value and returns its index. Thread-safe.

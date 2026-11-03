@@ -44,6 +44,11 @@ use crate::{
     ExtractSchedule, GpuResourceAppExt, RenderApp, RenderStartup,
 };
 
+/// Marks a bounded exclusive payload batch using the same atomic dirty protocol.
+pub fn mark_exclusive_payload_batch(indices: impl IntoIterator<Item = u32>, summary: &[AtomicU64], dirty: &[AtomicU64]) {
+    sparse_buffer_dirty::note_changed_batch(indices, summary, dirty);
+}
+
 /// A plugin that allows sparse updates of GPU buffers if only a small number of
 /// elements have changed.
 pub struct SparseBufferPlugin;
@@ -555,9 +560,13 @@ where
         self.note_changed_index(index);
     }
 
+    /// Exclusively borrows payload storage while retaining atomic dirty metadata.
+    pub fn exclusive_payload(&mut self) -> (super::ExclusivePayload<'_, T>, &[AtomicU64], &[AtomicU64]) {
+        (super::ExclusivePayload::new(&mut self.values), &self.dirty_bits, &self.summary)
+    }
+
     /// Writes at most 128 existing entries, marking each dirty word once.
-    /// Duplicate indices are written in slice order. Synchronization is the same
-    /// as [`Self::set`]; upload must wait for all writers to finish.
+    /// Duplicate indices are written in slice order, with shared atomic access.
     pub fn set_batch(&self, entries: &[(u32, T)]) {
         assert!(entries.len() <= 128);
         for (index, value) in entries {
