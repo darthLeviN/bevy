@@ -39,6 +39,11 @@ test('sampled application CPU weights actual raw Gecko stacks by deltas and sepa
   expect(cpu.coverage.stack_samples).toBe(4);
   expect(cpu.coverage.wasm_samples).toBe(2);
   expect(cpu.threads.map(row => row.tid)).toEqual([42, 43]);
+  for (const role of ['main', 'workers', 'total']) {
+    expect(cpu.breakdown.rows.reduce((sum, row) => sum + row[role + '_cpu_ms_per_update'], 0))
+      .toBeCloseTo(cpu[role + '_cpu_ms_per_update'], 12);
+  }
+  expect(cpu.breakdown.rows.find(row => row.id === 'unclassified').samples).toBe(2);
 });
 
 test('missing stacks and no identifiable Wasm are unavailable, not application zero', () => {

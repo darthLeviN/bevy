@@ -1,4 +1,5 @@
 import { cpuAccounting } from './cpu.mjs';
+import { wasmFunctionNames } from './breakdown.mjs';
 import { mkdir, readFile } from 'node:fs/promises';
 import { cliOptions, configuration, htmlDefaults, usage } from './options.mjs';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +30,14 @@ export function formatSummary(report) {
     'CPU is sampled Wasm attribution, not frame time; profiling affects update cadence.',
     'GPU is timestamped disjoint instrumented passes per sampled render frame; excludes copies and uninstrumented passes. See JSON for sample coverage.',
     ...reasons.map(reason => 'CPU unavailable — ' + reason),
+        ...report.results.flatMap(result => {
+          const breakdown = result.cpu_execution?.breakdown;
+          if (!breakdown) return [];
+          return [`\n${result.mode}/${result.requested_workers} — exclusive sampled CPU ms/update`,
+            'Operation                         Main   Workers     Total  Samples',
+            ...breakdown.rows.map(row => `${row.label.padEnd(32)} ${number(row.main_cpu_ms_per_update).padStart(7)} ${number(row.workers_cpu_ms_per_update).padStart(9)} ${number(row.total_cpu_ms_per_update).padStart(9)} ${String(row.samples).padStart(8)}`),
+            breakdown.limitation];
+        }),
   ].join('\n');
 }
 
@@ -255,7 +264,15 @@ export async function run({
         }
         const row = results.at(-1);
         row.cpu_profile_path = profilePath;
-        try { row.browser_thread_cpu = cpuAccounting(await readProfile(profilePath), row); }
+        try {
+                  let names = new Map(), symbolError;
+                  try { names = wasmFunctionNames(await readFile(new URL('./pkg/wasm_render_bench_bg.wasm', import.meta.url))); }
+                  catch (error) { symbolError = String(error); }
+                  row.browser_thread_cpu = cpuAccounting(await readProfile(profilePath), row, names);
+                  if (row.browser_thread_cpu.application_cpu?.breakdown) {
+                    Object.assign(row.browser_thread_cpu.application_cpu.breakdown, { function_names: names.size, symbol_error: symbolError });
+                  }
+                }
         catch (error) { row.browser_thread_cpu = { supported: false, reason: 'CPU profile unavailable: ' + String(error) }; }
         row.cpu_execution = row.browser_thread_cpu.application_cpu ?? {
           supported: false, reason: row.browser_thread_cpu.reason,

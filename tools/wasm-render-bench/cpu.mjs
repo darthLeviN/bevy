@@ -1,5 +1,7 @@
 import { processes, cpuMillisecondsPerUnit, hasWasmFrame } from '../../../../editor-benchmark/profile.mjs';
 
+import { stackCategory, cpuBreakdown } from './breakdown.mjs';
+
 function sampledApplicationCpu(threads, updates) {
   const sum = key => threads.reduce((total, row) => total + row[key], 0);
   const coverage = {
@@ -12,7 +14,7 @@ function sampledApplicationCpu(threads, updates) {
   };
   const metadata = { method: 'sampled Wasm stack attribution weighted by OS threadCPUDelta',
     scope: 'Marked content GeckoMain + DOM workers only; synchronous browser callees with Wasm ancestors included; JS-only and asynchronous work excluded',
-    coverage, threads };
+    coverage, threads, breakdown: cpuBreakdown(threads, updates) };
   const roleCpu = role => {
     const rows = threads.filter(row => row.role === role);
     if (!rows.length) return role === 'worker' ? 0 : null;
@@ -35,7 +37,7 @@ function sampledApplicationCpu(threads, updates) {
     total_cpu_ms_per_update: (main + workers) / updates };
 }
 
-export function cpuAccounting(profile, result) {
+export function cpuAccounting(profile, result, functionNames = new Map()) {
   const unavailable = reason => ({ supported: false, reason });
   const windows = [], markerCoverage = [];
   for (const process of processes(profile)) for (const thread of process.threads ?? []) {
@@ -76,7 +78,7 @@ export function cpuAccounting(profile, result) {
     if (schema?.threadCPUDelta === undefined || !data?.length) return unavailable('Firefox OS thread CPU deltas unavailable');
     let cpuDelta = 0, previous, first, last, boundaryMaxMs = 0, count = 0;
     let wasmDelta = 0, missingStackDelta = 0, stackSamples = 0, wasmSamples = 0;
-    const stacks = new Map();
+    const stacks = new Map(), categoryCache = new Map(), categories = {};
     for (const sample of data) {
       const time = sample[schema.time];
       if (!Number.isFinite(time) || (previous !== undefined && time <= previous)) {
@@ -93,7 +95,14 @@ export function cpuAccounting(profile, result) {
         const wasm = stacks.get(stack);
         if (wasm === null) missingStackDelta += delta;
         else stackSamples++;
-        if (wasm === true) { wasmDelta += delta; wasmSamples++; }
+        if (wasm === true) {
+                  wasmDelta += delta; wasmSamples++;
+                  if (!categoryCache.has(stack)) categoryCache.set(stack, stackCategory(thread, stack, functionNames));
+                  const category = categoryCache.get(stack);
+                  const entry = categories[category] ??= { cpu_ms: 0, samples: 0 };
+                  entry.cpu_ms += delta * millisecondsPerUnit;
+                  entry.samples++;
+                }
         first ??= previous;
         last = time;
         count++;
@@ -107,7 +116,7 @@ export function cpuAccounting(profile, result) {
       return unavailable('Profiler samples do not cover the complete CPU window');
     }
     rows.push({ pid: thread.pid, tid: thread.tid, name: thread.name,
-      role: thread === main ? 'main' : 'worker', cpu_ms: cpuDelta * millisecondsPerUnit,
+      role: thread === main ? 'main' : 'worker', categories, cpu_ms: cpuDelta * millisecondsPerUnit,
       sampled_wasm_cpu_ms: wasmDelta * millisecondsPerUnit,
       other_or_unclassified_cpu_ms: (cpuDelta - wasmDelta) * millisecondsPerUnit,
       missing_stack_cpu_ms: missingStackDelta * millisecondsPerUnit,

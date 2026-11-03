@@ -285,6 +285,28 @@ performance. It measures application-update cadence, not physically displayed FP
 
 ### OS CPU accounting and explicit GPU availability
 
+The default summary also prints an **exclusive sampled CPU breakdown** for each
+mode, with main/worker/total milliseconds per update and sample counts. The runner
+reads the function-name section of the exact served `pkg/wasm_render_bench_bg.wasm`
+and resolves Firefox `wasm-function[N]` locations without rebuilding or adding
+per-system markers. `breakdown.mjs` owns the ordered operation-name rules. Walking
+from leaf to root, the first recognized operation receives the entire sample's
+OS CPU delta; nested categories never double-count. The same measurement-window,
+Wasm-stack and worker-selection rules as the aggregate apply. Unrecognized Wasm
+stacks appear as `Unclassified Wasm`, so unrounded category totals conserve the
+reported application CPU totals independently for main and workers.
+
+This is statistical **stack-name attribution**, not exact per-system accounting:
+inlining and generic ECS wrappers can hide the executing system, and a recognized
+ancestor may receive its cost. The executor category includes task-pool machinery;
+it does not independently distinguish useful task execution, scheduling and spin.
+Sleeping time is not converted to CPU. Sample counts include zero-CPU samples and
+are not CPU weights; small counts and zero-count categories are inconclusive.
+Missing binary names are recorded in JSON and do not manufacture stage timings.
+`cpu_execution.breakdown` saves the method, limitations, symbol count and rows.
+No performance markers, wall-duration apportionment or additional runtime hooks
+are required, so capture settings and workload semantics remain unchanged.
+
 The default runner no longer installs wall-time boundary schedules or emits
 `schedule_timings`. It controls Firefox's supported `nsIProfiler` API and captures
 `GeckoMain` and `DOM Worker` threads. Profiles are saved beside the result JSON
