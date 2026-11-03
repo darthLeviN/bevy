@@ -731,6 +731,21 @@ shader-buffer identity invalidation still unprepares/rebuilds from current data.
 Freeing a slot clears pending writes. No derive API redesign or benchmark scene,
 CPU workload, material sharing, or frozen-color shortcut was introduced.
 
+**Existing upload-copy overhead (deferred).** `Queue::write_buffer` copies or
+snapshots prepared CPU bytes into wgpu/browser-owned upload storage before GPU
+use; the prepared CPU storage can be reused after the call returns. Native wgpu
+uses an explicit copy into mapped staging storage. The browser path passes a JS
+view, then WebGPU requires a snapshot; backend-internal physical copies and
+allocations are unspecified. The current browser queue is main-thread-affine;
+native worker uploads are possible but would add queue calls.
+
+For 10,000 meshes, current records (112 bytes) plus history (48 bytes) total
+1,600,000 bytes/update (1.6 MB, approximately 1.53 MiB), excluding material,
+culling and padding uploads. Leave direct worker uploads and direct staging
+changes deferred: the expected copy cost at this volume is low relative to the
+larger preparation hotspots. This is a prioritization judgment, not an isolated
+copy-time measurement or a claim of zero overhead.
+
 One matched headless pair used 1,000 moving meshes, four/zero workers and CPU work
 1, with fresh browsers/profiles, readiness-gated five-second warmup/sample and
 owned cleanup. Baseline: `2026-11-03T11-09-58.250Z.json`; after:

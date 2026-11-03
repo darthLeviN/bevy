@@ -2776,6 +2776,13 @@ pub fn write_batched_instance_buffers<GFBD>(
 
     let bin_unpacking_buffers = &mut *bin_unpacking_buffers;
 
+    // Uploads below use Queue::write_buffer, which copies/snapshots prepared CPU
+    // bytes into backend-owned upload storage; the source can be reused when the
+    // call returns, without waiting for GPU completion. For 10,000 moving meshes,
+    // current-instance and history payloads total about 1.6 MB per update, excluding
+    // materials and other buffers. Leave this extra copy in place for now: its
+    // expected cost is low relative to preparation (not measured in isolation).
+    // Direct staging/worker uploads are deferred; the browser queue is thread-affine.
     ComputeTaskPool::get().scope(|scope| {
         scope.spawn(async {
             #[cfg(feature = "trace")]
