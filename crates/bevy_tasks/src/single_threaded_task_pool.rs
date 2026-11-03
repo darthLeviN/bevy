@@ -103,6 +103,11 @@ impl TaskPool {
         1
     }
 
+    /// No background workers are available in the single-threaded pool.
+    pub fn scope_worker_num(&self) -> usize {
+        0
+    }
+
     /// Allows spawning non-`'static` futures on the thread pool. The function takes a callback,
     /// passing a scope object into it. The scope object provided to the callback can be used
     /// to spawn tasks. This function will await the completion of all tasks before returning.

@@ -257,6 +257,11 @@ impl TaskPool {
         self.threads.len()
     }
 
+    /// Number of pool workers available to scoped tasks under the current affinity policy.
+    pub fn scope_worker_num(&self) -> usize {
+        if crate::scope_dispatch::workers_enabled() { self.thread_num() } else { 0 }
+    }
+
     /// Effective query parallelism for the current scope's affinity policy.
     ///
     /// A GPU-affine local scope has one execution thread, even when this pool
@@ -807,7 +812,9 @@ mod tests {
     fn browser_affinity_boundary_keeps_nested_scopes_local_and_restores_workers() {
         let pool = TaskPoolBuilder::new().num_threads(2).build();
         let owner = thread::current().id();
+        assert_eq!(pool.scope_worker_num(), 2);
         let outputs = crate::with_local_task_scopes(|| pool.scope_with_executor(false, None, |scope| {
+            assert_eq!(pool.scope_worker_num(), 0);
             for _ in 0..8 {
                 let pool = &pool;
                 scope.spawn(async move {
@@ -819,6 +826,7 @@ mod tests {
             }
         }));
         assert_eq!(outputs, vec![true; 8]);
+        assert_eq!(pool.scope_worker_num(), 2);
         let normal = pool.scope_with_executor(false, None, |scope| {
             for _ in 0..8 {
                 scope.spawn(async move { thread::current().id() != owner });

@@ -2579,6 +2579,40 @@ fn flush_exclusive_mesh_input_batch(
     entries.clear();
 }
 
+/// Reused staging storage for count-balanced collection across extraction queues.
+#[derive(Default)]
+pub struct MeshCollectionStaging {
+    changed: Vec<Option<(MainEntity, RenderMeshInstanceGpuBuilder, Option<MeshCullingData>)>>,
+}
+
+/// Main gets 110% of a normal worker share, independently of local payload batching.
+fn mesh_collection_plan(count: usize, workers: usize) -> (usize, impl Iterator<Item = usize>) {
+    // A minimum worker needs 256 items and main needs ceil(256 * 1.1) = 282.
+    let tasks = workers.min(count.saturating_sub(282) / 256);
+    let remaining = if tasks == 0 {
+        0
+    } else {
+        let mut low = tasks * 256;
+        let mut high = count;
+        // Maximize balanced worker coverage subject to main >= ceil(1.1 * max_worker).
+        // The predicate is monotone. Subtraction and quotient/remainder arithmetic
+        // avoid overflow even at usize::MAX; no floating-point rounding is involved.
+        while low < high {
+            let candidate = low + (high - low) / 2 + (high - low) % 2;
+            let largest = candidate / tasks + usize::from(candidate % tasks != 0);
+            let extra = largest / 10 + usize::from(largest % 10 != 0);
+            let main = count - candidate;
+            if main >= largest && main - largest >= extra {
+                low = candidate;
+            } else {
+                high = candidate - 1;
+            }
+        }
+        low
+    };
+    (count - remaining, (0..tasks).map(move |i| remaining / tasks + usize::from(i < remaining % tasks)))
+}
+
 /// Creates the [`RenderMeshInstanceGpu`]s and [`MeshInputUniform`]s when GPU
 /// preprocessing is in use.
 pub fn collect_meshes_for_gpu_building(
@@ -2597,6 +2631,7 @@ pub fn collect_meshes_for_gpu_building(
     morph_indices: Res<MorphIndices>,
     frame_count: Res<FrameCount>,
     mut meshes_to_reextract_next_frame: ResMut<MeshesToReextractNextFrame>,
+    mut staging: Local<MeshCollectionStaging>,
 ) {
     let RenderMeshInstances::GpuBuilding(render_mesh_instances) =
         render_mesh_instances.into_inner()
@@ -2647,75 +2682,29 @@ pub fn collect_meshes_for_gpu_building(
         let mesh_culling_data_buffer = &*mesh_culling_data_buffer;
         let morph_indices = &*morph_indices;
 
-        // Spawn workers on the taskpool to prepare and update meshes in parallel.
-        ComputeTaskPool::get().scope(|scope| {
-            // Iterate through each queue, spawning a task for each queue. This loop completes quickly
-            // as it does very little work, it is just spawning and moving data into tasks in a loop.
-            for queue in render_mesh_instance_queues.iter_mut() {
-                match *queue {
-                    RenderMeshInstanceGpuQueue::None => {
-                        // This can only happen if the queue is empty.
-                    }
-
-                    RenderMeshInstanceGpuQueue::CpuCulling {
-                        ref mut changed,
-                        ref mut removed,
-                    } => {
-                        let prepared_tx = prepared_tx.clone();
-                        let reextract_tx = reextract_tx.clone();
-                        let removed_tx = removed_tx.clone();
-                        scope.spawn(async move {
+        staging.changed.clear();
+        for queue in render_mesh_instance_queues.iter_mut() {
+            match queue {
+                RenderMeshInstanceGpuQueue::None => {}
+                RenderMeshInstanceGpuQueue::CpuCulling { changed, removed } => {
+                    staging.changed.extend(changed.drain(..).map(|(entity, builder)| Some((entity, builder, None))));
+                    for entity in removed.drain(..) { removed_tx.send(entity).unwrap(); }
+                }
+                RenderMeshInstanceGpuQueue::GpuCulling { changed_cpu_culling, changed_gpu_culling, removed } => {
+                    staging.changed.extend(changed_cpu_culling.drain(..).chain(changed_gpu_culling.drain(..))
+                        .map(|(entity, builder, culling)| Some((entity, builder, Some(culling)))));
+                    for entity in removed.drain(..) { removed_tx.send(entity).unwrap(); }
+                }
+            }
+        }
+        let process = |items: &mut [Option<(MainEntity, RenderMeshInstanceGpuBuilder, Option<MeshCullingData>)>]| {
                             #[cfg(feature = "trace")]
                             let _span = info_span!("prepared_mesh_producer").entered();
                             let mut geometry_cache = MeshCollectionGeometryCache::default();
-                            changed
-                                .drain(..)
-                                .for_each(|(entity, mesh_instance_builder)| {
-                                    match mesh_instance_builder.prepare(
-                                        entity,
-                                        mesh_allocator,
-                                        &mut geometry_cache,
-                                        mesh_material_ids,
-                                        render_material_bindings,
-                                        render_lightmaps,
-                                        skin_uniforms,
-                                        morph_indices,
-                                        frame_count,
-                                    ) {
-                                        Some(prepared) => {
-                                            prepared_tx.send((entity, prepared, None)).ok();
-                                        }
-                                        None => {
-                                            reextract_tx.send(entity).ok();
-                                        }
-                                    }
-                                });
-
-                            for entity in removed.drain(..) {
-                                removed_tx.send(entity).unwrap();
-                            }
-                        });
-                    }
-
-                    RenderMeshInstanceGpuQueue::GpuCulling {
-                        ref mut changed_cpu_culling,
-                        ref mut changed_gpu_culling,
-                        ref mut removed,
-                    } => {
-                        let prepared_tx = prepared_tx.clone();
-                        let reextract_tx = reextract_tx.clone();
-                        let removed_tx = removed_tx.clone();
-                        scope.spawn(async move {
-                            #[cfg(feature = "trace")]
-                            let _span = info_span!("prepared_mesh_producer").entered();
-                            let mut geometry_cache = MeshCollectionGeometryCache::default();
-                            // One bounded allocation per task, reused for every flush.
+                            // Payload batches are task-local, not dispatch units.
                             let mut input_batch = Vec::with_capacity(128);
-                            for (entity, mesh_instance_builder, mesh_culling_builder) in
-                                changed_cpu_culling
-                                    .drain(..)
-                                    .chain(changed_gpu_culling.drain(..))
-                            {
+                            for item in items {
+                                let (entity, mesh_instance_builder, mesh_culling_builder) = item.take().unwrap();
                                 let Some(prepared) = mesh_instance_builder.prepare(
                                     entity,
                                     mesh_allocator,
@@ -2731,6 +2720,10 @@ pub fn collect_meshes_for_gpu_building(
                                     continue;
                                 };
 
+                                let Some(mesh_culling_builder) = mesh_culling_builder else {
+                                    prepared_tx.send((entity, prepared, None)).ok();
+                                    continue;
+                                };
                                 let Some(render_mesh_instance) = render_mesh_instances.get(&entity)
                                 else {
                                     // We must take the slow path because we
@@ -2787,21 +2780,26 @@ pub fn collect_meshes_for_gpu_building(
                             // Scope joins before slow-path updates, removals, reuse or uploads.
                             flush_exclusive_mesh_input_batch(&mut input_batch, current_payload, history_payload, history_cursor, dirty, summary);
 
-                            for entity in removed.drain(..) {
-                                removed_tx.send(entity).unwrap();
-                            }
-                        });
-                    }
+        };
+        let pool = ComputeTaskPool::get();
+        let (caller_count, shares) = mesh_collection_plan(staging.changed.len(), pool.scope_worker_num());
+        let (caller, mut remaining) = staging.changed.split_at_mut(caller_count);
+        if remaining.is_empty() {
+            process(caller);
+        } else {
+            pool.scope(|scope| {
+                for size in shares {
+                    let (share, rest) = remaining.split_at_mut(size);
+                    remaining = rest;
+                    let process = &process;
+                    scope.spawn(async move { process(share); });
                 }
-            }
-
-            // Drop the senders owned by the scope, so the only senders left are those captured by the
-            // spawned tasks. When the tasks are complete, the channels will close, and the consumer
-            // will finish. Without this, the scope would deadlock on the blocked consumer.
-            drop(prepared_tx);
-            drop(reextract_tx);
-            drop(removed_tx);
-        });
+                process(caller);
+            });
+        }
+        drop(prepared_tx);
+        drop(reextract_tx);
+        drop(removed_tx);
     }
 
     while let Ok(batch) = prepared_rx.recv() {

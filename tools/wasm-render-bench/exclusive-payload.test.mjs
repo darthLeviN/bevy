@@ -9,7 +9,7 @@ test('actual exclusive phase and collector: parallel bytes/history, claims, over
     const module = new URL('../../crates/bevy_render/src/render_resource/exclusive_payload.rs', import.meta.url).pathname;
     const dirtyModule = new URL('../../crates/bevy_render/src/render_resource/sparse_buffer_dirty.rs', import.meta.url).pathname;
     const mesh = readFileSync(new URL('../../crates/bevy_pbr/src/render/mesh.rs', import.meta.url), 'utf8');
-    const helper = mesh.slice(mesh.indexOf('fn flush_exclusive_mesh_input_batch('), mesh.indexOf('/// Creates the [`RenderMeshInstanceGpu`]s', mesh.indexOf('fn flush_exclusive_mesh_input_batch(')));
+    const helper = mesh.slice(mesh.indexOf('fn flush_exclusive_mesh_input_batch('), mesh.indexOf('/// Reused staging storage', mesh.indexOf('fn flush_exclusive_mesh_input_batch(')));
     const fixture = `
 extern crate alloc;
 extern crate self as bevy_render;
