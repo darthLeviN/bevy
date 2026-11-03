@@ -1548,6 +1548,14 @@ pub fn base_specialize(
     layout: &MeshVertexBufferLayoutRef,
     properties: &Arc<MaterialProperties>,
 ) -> Result<CachedRenderPipelineId, SpecializedMeshPipelineError> {
+    // Cache hits must not clone the mesh pipeline's owned layout descriptors.
+    if let Some(pipelines) =
+        world.get_resource::<SpecializedMeshPipelines<MaterialPipelineSpecializer>>()
+        && let Some(id) = pipelines.get_pipeline(&key, layout)
+    {
+        return Ok(id);
+    }
+
     world.resource_scope(
         |world, mut pipelines: Mut<SpecializedMeshPipelines<MaterialPipelineSpecializer>>| {
             let mesh_pipeline = world.resource::<MeshPipeline>().clone();
