@@ -654,9 +654,9 @@ impl BufferDataInput for MeshInputUniform {
     type Previous = PreviousMeshInputUniform;
 }
 
-impl_atomic_pod!(MeshInputUniform, MeshInputUniformBlob);
+impl_atomic_pod!(MeshInputUniform, MeshInputUniformBlob, atomic_u64);
 
-impl_atomic_pod!(PreviousMeshInputUniform, PreviousMeshInputUniformBlob);
+impl_atomic_pod!(PreviousMeshInputUniform, PreviousMeshInputUniformBlob, atomic_u64);
 
 /// Information about each mesh instance needed to cull it on GPU.
 ///
@@ -1448,6 +1448,51 @@ impl RenderMeshInstanceGpuQueue {
     }
 }
 
+/// Geometry allocations are immutable during collection. Keep only the last mesh
+/// per worker, and discard the cache before the allocator can change next frame.
+#[derive(Default)]
+struct MeshCollectionGeometryCache {
+    last: Option<(AssetId<Mesh>, MeshCollectionGeometry)>,
+}
+
+#[derive(Clone, Copy)]
+struct MeshCollectionGeometry {
+    first_vertex_index: u32,
+    first_index_index: u32,
+    index_count: u32,
+    metadata_index: u32,
+}
+
+impl MeshCollectionGeometryCache {
+    fn get(&mut self, asset_id: AssetId<Mesh>, allocator: &MeshAllocator) -> MeshCollectionGeometry {
+        if let Some((cached_id, geometry)) = self.last {
+            if cached_id == asset_id {
+                return geometry;
+            }
+        }
+        let (first_vertex_index, vertex_count) = allocator
+            .mesh_vertex_slice(&asset_id)
+            .map(|slice| (slice.range.start, slice.range.end - slice.range.start))
+            .unwrap_or((0, 0));
+        let (first_index_index, index_count) = allocator
+            .mesh_index_slice(&asset_id)
+            .map(|slice| (slice.range.start, slice.range.end - slice.range.start))
+            .unwrap_or((0, vertex_count));
+        let metadata_index = allocator
+            .mesh_metadata_slice(&asset_id)
+            .map(|slice| slice.range.start)
+            .unwrap_or(0);
+        let geometry = MeshCollectionGeometry {
+            first_vertex_index,
+            first_index_index,
+            index_count,
+            metadata_index,
+        };
+        self.last = Some((asset_id, geometry));
+        geometry
+    }
+}
+
 impl RenderMeshInstanceGpuBuilder {
     /// Prepares the data needed to update the mesh instance.
     ///
@@ -1456,6 +1501,7 @@ impl RenderMeshInstanceGpuBuilder {
         mut self,
         entity: MainEntity,
         mesh_allocator: &MeshAllocator,
+        geometry_cache: &mut MeshCollectionGeometryCache,
         mesh_material_ids: &RenderMaterialInstances,
         render_material_bindings: &RenderMaterialBindings,
         render_lightmaps: &RenderLightmaps,
@@ -1477,23 +1523,12 @@ impl RenderMeshInstanceGpuBuilder {
         };
         self.shared.material_bindings_index = mesh_material_binding_id;
 
-        let (first_vertex_index, vertex_count) =
-            match mesh_allocator.mesh_vertex_slice(&self.shared.asset_id.into()) {
-                Some(mesh_vertex_slice) => (
-                    mesh_vertex_slice.range.start,
-                    mesh_vertex_slice.range.end - mesh_vertex_slice.range.start,
-                ),
-                None => (0, 0),
-            };
-        let (mesh_is_indexed, first_index_index, index_count) =
-            match mesh_allocator.mesh_index_slice(&self.shared.asset_id.into()) {
-                Some(mesh_index_slice) => (
-                    true,
-                    mesh_index_slice.range.start,
-                    mesh_index_slice.range.end - mesh_index_slice.range.start,
-                ),
-                None => (false, 0, 0),
-            };
+        let MeshCollectionGeometry {
+            first_vertex_index,
+            first_index_index,
+            index_count,
+            metadata_index,
+        } = geometry_cache.get(self.shared.asset_id.into(), mesh_allocator);
         let current_skin_index = match skin_uniforms.skin_byte_offset(entity) {
             Some(skin_index) => skin_index.index(),
             None => u32::MAX,
@@ -1514,10 +1549,6 @@ impl RenderMeshInstanceGpuBuilder {
             None => u32::MAX,
         };
 
-        let metadata_index = mesh_allocator
-            .mesh_metadata_slice(&self.shared.asset_id.into())
-            .map(|mesh_metadata_slice| mesh_metadata_slice.range.start)
-            .unwrap_or(0);
 
         // Create the mesh input uniform.
         let material_slot = u32::from(self.shared.material_bindings_index.slot);
@@ -1535,11 +1566,7 @@ impl RenderMeshInstanceGpuBuilder {
             timestamp: timestamp.0,
             first_vertex_index,
             first_index_index,
-            index_count: if mesh_is_indexed {
-                index_count
-            } else {
-                vertex_count
-            },
+            index_count,
             current_skin_index,
             material_and_lightmap_bind_group_slot,
             tag: self.shared.tag,
@@ -2490,6 +2517,41 @@ pub fn set_mesh_motion_vector_flags(
     }
 }
 
+fn queue_mesh_input_batch(
+    entries: &mut Vec<(u32, MeshInputUniform)>,
+    index: u32,
+    uniform: MeshInputUniform,
+    current: &InstanceInputUniformBuffer<MeshInputUniform>,
+    previous: &PreviousInstanceInputUniformBuffer<PreviousMeshInputUniform>,
+) {
+    if entries.len() == 128 || entries.iter().any(|entry| entry.0 == index) {
+        flush_mesh_input_batch(entries, current, previous);
+    }
+    entries.push((index, uniform));
+}
+
+// Flush only distinct indices: repeated indices start a new batch so history
+// always observes the preceding write, including within the same task.
+fn flush_mesh_input_batch(
+    entries: &mut Vec<(u32, MeshInputUniform)>,
+    current: &InstanceInputUniformBuffer<MeshInputUniform>,
+    previous: &PreviousInstanceInputUniformBuffer<PreviousMeshInputUniform>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut history = [PreviousMeshInputUniform::default(); 128];
+    for ((index, _), old) in entries.iter().zip(history.iter_mut()) {
+        old.world_from_local = current.get_unchecked(*index).world_from_local;
+    }
+    let first = previous.push_batch(&history[..entries.len()]);
+    for (offset, (_, uniform)) in entries.iter_mut().enumerate() {
+        uniform.previous_input_index = first + offset as u32;
+    }
+    current.set_batch(entries);
+    entries.clear();
+}
+
 /// Creates the [`RenderMeshInstanceGpu`]s and [`MeshInputUniform`]s when GPU
 /// preprocessing is in use.
 pub fn collect_meshes_for_gpu_building(
@@ -2576,12 +2638,14 @@ pub fn collect_meshes_for_gpu_building(
                         scope.spawn(async move {
                             #[cfg(feature = "trace")]
                             let _span = info_span!("prepared_mesh_producer").entered();
+                            let mut geometry_cache = MeshCollectionGeometryCache::default();
                             changed
                                 .drain(..)
                                 .for_each(|(entity, mesh_instance_builder)| {
                                     match mesh_instance_builder.prepare(
                                         entity,
                                         mesh_allocator,
+                                        &mut geometry_cache,
                                         mesh_material_ids,
                                         render_material_bindings,
                                         render_lightmaps,
@@ -2615,14 +2679,18 @@ pub fn collect_meshes_for_gpu_building(
                         scope.spawn(async move {
                             #[cfg(feature = "trace")]
                             let _span = info_span!("prepared_mesh_producer").entered();
+                            let mut geometry_cache = MeshCollectionGeometryCache::default();
+                            // One bounded allocation per task, reused for every flush.
+                            let mut input_batch = Vec::with_capacity(128);
                             for (entity, mesh_instance_builder, mesh_culling_builder) in
                                 changed_cpu_culling
                                     .drain(..)
                                     .chain(changed_gpu_culling.drain(..))
                             {
-                                let Some(mut prepared) = mesh_instance_builder.prepare(
+                                let Some(prepared) = mesh_instance_builder.prepare(
                                     entity,
                                     mesh_allocator,
+                                    &mut geometry_cache,
                                     mesh_material_ids,
                                     render_material_bindings,
                                     render_lightmaps,
@@ -2678,23 +2746,19 @@ pub fn collect_meshes_for_gpu_building(
                                 let current_uniform_index =
                                     render_mesh_instance.gpu_specific.current_uniform_index();
 
-                                let previous_world_from_local = current_input_buffer
-                                    .get_unchecked(current_uniform_index)
-                                    .world_from_local;
-                                let previous_input_index =
-                                    previous_input_buffer.push(PreviousMeshInputUniform {
-                                        world_from_local: previous_world_from_local,
-                                    });
-                                prepared.mesh_input_uniform.previous_input_index =
-                                    previous_input_index;
-
-                                current_input_buffer
-                                    .set(current_uniform_index, prepared.mesh_input_uniform);
+                                // Normally extraction owns one entry per entity. Preserve
+                                // scalar history semantics even for duplicate queued indices.
+                                queue_mesh_input_batch(
+                                    &mut input_batch, current_uniform_index,
+                                    prepared.mesh_input_uniform, current_input_buffer, previous_input_buffer,
+                                );
                                 // Bounds are model-space: moving the instance doesn't
                                 // require another culling-buffer upload.
                                 mesh_culling_data_buffer
                                     .set_if_changed_bytes(current_uniform_index, mesh_culling_builder);
                             }
+                            // Scope joins before slow-path updates, removals, reuse or uploads.
+                            flush_mesh_input_batch(&mut input_batch, current_input_buffer, previous_input_buffer);
 
                             for entity in removed.drain(..) {
                                 removed_tx.send(entity).unwrap();

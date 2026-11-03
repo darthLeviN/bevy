@@ -27,6 +27,34 @@ pub(crate) fn note_changed_index(index: u32, summary: &[AtomicU64], dirty_bits: 
     }
 }
 
+/// Marks a bounded batch, merging noncontiguous indices before touching shared words.
+/// Writers may share words; draining still requires exclusive access after joining writers.
+pub(crate) fn note_changed_batch(indices: impl IntoIterator<Item = u32>, summary: &[AtomicU64], dirty_bits: &[AtomicU64]) {
+    let mut words = [(0usize, 0u64); 128];
+    let mut len = 0;
+    for index in indices {
+        assert!(len < words.len(), "dirty batch exceeds 128 entries");
+        words[len] = (index as usize / 64, 1 << (index % 64));
+        len += 1;
+    }
+    words[..len].sort_unstable_by_key(|entry| entry.0);
+    let mut cursor = 0;
+    while cursor < len {
+        let (word_index, mut mask) = words[cursor];
+        cursor += 1;
+        while cursor < len && words[cursor].0 == word_index {
+            mask |= words[cursor].1;
+            cursor += 1;
+        }
+        let word = &dirty_bits[word_index];
+        if word.load(Ordering::Relaxed) & mask != mask
+            && word.fetch_or(mask, Ordering::Relaxed) == 0
+        {
+            summary[word_index / 64].fetch_or(1 << (word_index % 64), Ordering::Relaxed);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

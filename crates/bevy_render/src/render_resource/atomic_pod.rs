@@ -16,8 +16,7 @@
 
 use bytemuck::Pod;
 
-/// Data that can be converted to an array of [`std::sync::atomic::AtomicU32`]
-/// values.
+/// Data that can be converted to an array of atomic unsigned words.
 ///
 /// That array is known as the *blob* ([`Self::Blob`]). The trait provides
 /// methods to copy data into and out of the blob type.
@@ -29,7 +28,7 @@ use bytemuck::Pod;
 pub trait AtomicPod: Pod + Default + Send + Sync + 'static {
     /// The *blob* type that allows shared mutation.
     ///
-    /// This type must be an array of [`std::sync::atomic::AtomicU32`]s.
+    /// This type must wrap an array of atomic `u32` or `u64` words.
     /// Because the renderer can't guarantee that, the [`AtomicPodBlob`] trait
     /// is unsafe. However, the [`crate::impl_atomic_pod`] macro can
     /// automatically generate safe implementations of [`AtomicPodBlob`] for
@@ -49,7 +48,7 @@ pub trait AtomicPod: Pod + Default + Send + Sync + 'static {
 }
 
 /// Describes a type that has the same bit pattern as another type, but is made
-/// up entirely of an array of [`std::sync::atomic::AtomicU32`] values.
+/// up entirely of an array of atomic `u32` or `u64` values.
 ///
 /// This trait enables values of whatever type this mirrors to be written from
 /// multiple threads. It's memory-safe because the type must be POD. However,
@@ -65,7 +64,10 @@ pub trait AtomicPod: Pod + Default + Send + Sync + 'static {
 /// # Safety
 ///
 /// This trait must only be implemented by types that are `#[repr(transparent)]`
-/// wrappers around `[AtomicU32; N]` for some N (where N may legally be 0).
+/// wrappers around `[AtomicU32; N]` or `[AtomicU64; N]` for some N (which may be 0).
+/// The wrapper must have exactly the size and byte representation of its POD type;
+/// its allocation must satisfy the atomic word alignment. All shared accesses to
+/// a blob must use its chosen word width; mixing overlapping widths is not allowed.
 /// That's because values implementing this trait are read as a `&[u8]` when
 /// uploading to the GPU.
 pub unsafe trait AtomicPodBlob: Default + Send + Sync + 'static {}
@@ -114,24 +116,42 @@ pub unsafe trait AtomicPodBlob: Default + Send + Sync + 'static {}
 ///
 /// The POD type must have a size that's a multiple of 4 bytes, as must the
 /// types of any fields that are named in `field` declarations.
+///
+/// Whole-record types with sizes divisible by 8 can opt into 64-bit words with
+/// `impl_atomic_pod!(Type, TypeBlob, atomic_u64)`. This form provides no field
+/// accessors, so every shared access uses the same width. On Wasm this halves
+/// the atomic payload instruction count; it does not make whole-record writes
+/// atomic or replace the caller's join/publication requirements.
 #[macro_export]
 macro_rules! impl_atomic_pod {
+    ($pod_ty:ty, $blob_ty:ident, atomic_u64 $(,)?) => {
+        $crate::impl_atomic_pod!(@words $pod_ty, $blob_ty, u64, AtomicU64, 8);
+    };
     (
         $pod_ty: ty,
         $blob_ty: ident
         $(, field($field_name: ident : $field_ty: ty, $getter: ident $(, $($setter: ident)?)?))*
         $(,)?
     ) => {
+        $crate::impl_atomic_pod!(@words $pod_ty, $blob_ty, u32, AtomicU32, 4
+            $(, field($field_name: $field_ty, $getter $(, $($setter)?)?))*);
+    };
+    (
+        @words $pod_ty: ty,
+        $blob_ty: ident, $word_ty:ty, $atomic_ty:ident, $word_size:literal
+        $(, field($field_name: ident : $field_ty: ty, $getter: ident $(, $($setter: ident)?)?))*
+        $(,)?
+    ) => {
         #[derive(::bevy_derive::Deref, ::bevy_derive::DerefMut)]
         #[repr(transparent)]
         pub struct $blob_ty(
-            pub [::core::sync::atomic::AtomicU32; ::core::mem::size_of::<$pod_ty>() / 4],
+            pub [::core::sync::atomic::$atomic_ty; ::core::mem::size_of::<$pod_ty>() / $word_size],
         );
 
         // Manually implement `Default` as `#[derive(Default)]` can't be used for arrays larger than 32 elements.
         impl Default for $blob_ty {
             fn default() -> Self {
-                Self([const { ::core::sync::atomic::AtomicU32::new(0) }; ::core::mem::size_of::<$pod_ty>() / 4])
+                Self([const { ::core::sync::atomic::$atomic_ty::new(0) }; ::core::mem::size_of::<$pod_ty>() / $word_size])
             }
         }
 
@@ -140,13 +160,13 @@ macro_rules! impl_atomic_pod {
 
             fn read_from_blob(blob: &Self::Blob) -> Self {
                 const _ASSERT_POD_TYPE_SIZE: () = ::core::assert!(
-                    ::core::mem::size_of::<$pod_ty>() % 4 == 0
+                    ::core::mem::size_of::<$pod_ty>() % $word_size == 0
                 );
 
                 // Read the value word by word.
                 // Note that relaxed atomics, at the hardware level, are as
                 // cheap as regular loads on x86-64 and AArch64.
-                let nonatomic_data: [u32; ::core::mem::size_of::<$pod_ty>() / 4] =
+                let nonatomic_data: [$word_ty; ::core::mem::size_of::<$pod_ty>() / $word_size] =
                     ::core::array::from_fn(|i| {
                         blob.0[i].load(::bevy_platform::sync::atomic::Ordering::Relaxed)
                     });
@@ -157,7 +177,7 @@ macro_rules! impl_atomic_pod {
                 // Store the value word by word.
                 // Note that relaxed atomics, at the hardware level, are as
                 // cheap as regular loads on x86-64 and AArch64.
-                let src: [u32; ::core::mem::size_of::<$pod_ty>() / 4] =
+                let src: [$word_ty; ::core::mem::size_of::<$pod_ty>() / $word_size] =
                     ::bytemuck::must_cast(*self);
                 for (dest, src) in blob.0.iter().zip(src.iter()) {
                     dest.store(*src, ::bevy_platform::sync::atomic::Ordering::Relaxed);
@@ -165,8 +185,8 @@ macro_rules! impl_atomic_pod {
             }
         }
 
-        // SAFETY: Atomic POD blobs must be bit-castable to a flat list of
-        // `AtomicU32`s, which we ensured above.
+        // SAFETY: The transparent wrapper contains only atomic unsigned words.
+        // The casts above check that their byte size matches the POD value.
         unsafe impl $crate::render_resource::AtomicPodBlob for $blob_ty {}
 
         impl<'a> ::core::convert::From<&'a $pod_ty> for $blob_ty {

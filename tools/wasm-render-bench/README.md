@@ -135,6 +135,190 @@ or launch anything. The direct runner uses the same parser with headless default
 A live command must use current artifacts. A runtime timeout requires stopping
 and reporting, not automatically retrying or extending deadlines.
 
+## Whole-record atomic word width (2026-11-03)
+
+The post-batching profile's leading collection stacks end directly in sparse
+`set_batch` and history `push_batch`, called by `flush_mesh_input_batch`; they do
+not hide synchronous JS/device capability getters. Inspection of the served
+Wasm code bodies confirmed 28 `i32.atomic.store` instructions per mesh input and
+12 per previous-transform record. In the earlier `13-08-57.657Z` threaded report,
+these two named contributors account for 5.03 and 2.27 ms/update, versus 0.32 ms
+for builder preparation. This is sampled attribution, not instruction-level
+sampling or proof that every attributed cycle is an atomic store. The collection
+task wrapper also contains real work, including duplicate detection, preparation,
+shared instance writes and culling-bound comparisons.
+
+`impl_atomic_pod!` now has an opt-in `atomic_u64` whole-record form. Only
+`MeshInputUniform` and `PreviousMeshInputUniform` use it; existing field-addressed
+blobs remain 32-bit. Shared accesses remain atomic and consistently use one word
+width per blob. Sizes and uploaded bytes are unchanged; blob allocations provide
+64-bit alignment. This neither makes multiword snapshots coherent nor replaces
+worker joins before upload/removal/reuse. Geometry caching, batch size 128,
+duplicate handling, history reservations, dirty-mask merging, metadata lookups,
+previous transforms, events and workload are preserved. No plain shared writes
+or partition-lock protocol was added.
+
+The cached O3 build and wasm-bindgen generation passed. The new served Wasm's
+`set_batch` body (function 20819, offset 20758799) contains 14 `i64.atomic.store`
+instructions; history is now inlined into `flush_mesh_input_batch` (function
+3480, offset 9775145), which contains six. The old bodies were function 12172
+(offset 16972015) and function 14431 (offset 18140984). These are exact-build
+inspection identifiers, not mappings to apply across rebuilds. This removes
+200,000 payload atomic stores per 10,000-mesh update; it does not remove payload
+bytes, all history reads, or batch scans/copies.
+
+`bun test mesh-batching.test.mjs mesh-collection.test.mjs` passes three Bun tests
+executing twelve Rust tests in isolated fixtures. Added coverage expands the
+production macro itself (only external bit casts and derives are stubbed), checking
+112/48-byte layouts, byte-identical NaN/signed-zero representations, 14/6-word
+storage, unchanged 32-bit field getters/setters, and joined multiworker writes
+across six rounds of slot reuse. Existing actual-production collection/batching
+fixtures retain scalar/history equivalence, duplicate ordering, dirty-word
+contention, removal/reuse and frame-local metadata/geometry invalidation coverage.
+The fixtures do not execute full GPU visibility/layer routing or motion-vector
+pixels; the Wasm build uses the real dependencies.
+
+Matched root-runner commands used exactly `--headless --meshes 10000 --workers 4
+--cpu-work 1`, two fresh browser sessions each, readiness-gated warmup (6.09–6.30 s)
+and separate samples (5.04–5.07 s). Reports under root
+`.cache/bevy-web-ecs/render-results/`: before `2026-11-03T13-14-45.482Z.json`;
+after `2026-11-03T13-17-48.882Z.json`. Both report status `ok`, 10,001 meshes and
+material assets, verified motion/CPU reference and GPU readiness, with browser-main
+GPU ownership unchanged.
+
+| Metric | Threaded before → after | Serial before → after |
+| --- | --- | --- |
+| Updates/sec | 12.25 → 12.43 | 13.04 → 12.10 |
+| Sampled total CPU ms/update | 83.02 → 80.16 | 75.35 → 77.29 |
+| Render preparation ms/update | 33.07 → 31.35 | 32.84 → 31.38 |
+| Collection-associated named group ms/update | 10.83 → 7.84 | 11.67 → 8.24 |
+| Sparse input set_batch ms/update | 4.14 → 1.57 | 4.64 → 1.30 |
+| History push_batch + flush ms/update | 3.18 → 3.14 | 2.55 → 2.75 |
+| GPU instrumented passes mean ms/frame | 0.1129 → 0.1128 | 0.1131 → 0.1125 |
+
+Contributor analysis uses captured named labels, with no rebuilt-index mapping
+for older samples. The group exclusively sums collection task wrappers, builder
+preparation, sparse input/culling setters, history pushes and flushes; history
+inlining is included rather than counted as eliminated. The localized group
+falls about 28–29% in both modes, consistent with the instruction reduction, but
+one pair with 61–66 updates and 10-ms profiler samples is not repeatability proof.
+**There is no demonstrated consistent end-to-end gain:** threaded cadence rises
+1.4%, while serial falls 7.2%, with variation in unrelated categories. GPU timings
+exclude copies/uninstrumented passes; update cadence is not physical presentation.
+No further small speculative optimization was stacked on this result.
+
+## Batched mesh input and transform history (2026-11-03)
+
+The existing GPU-collection fast path now accumulates at most 128 distinct sparse
+indices per task-local vector, reused across flushes. `queue_mesh_input_batch`
+flushes before duplicate indices, preserving sequential previous-transform reads.
+`flush_mesh_input_batch` reads the old transforms, calls
+`PreviousInstanceInputUniformBuffer::push_batch` once, maps contiguous history
+indices back to the original sparse indices, then calls
+`InstanceInputUniformBuffer::set_batch`. Each worker flushes before returning;
+the scope joins before slow-path updates, removals, index reuse or GPU uploads.
+New entities and layer/culling-mode changes retain the original slow path,
+including the first-frame history sentinel. Geometry caching, live material/skin/
+morph/flag preparation, culling-bound comparisons and the benchmark workload are
+unchanged.
+
+`AtomicSparseBufferVec::set_batch` retains atomic payload stores, but sorts fixed
+stack storage of dirty-word masks and merges them before marking. There is at
+most one dirty-word RMW per distinct word per chunk (none if already dirty),
+with the existing first-transition summary marking. `fetch_or` preserves other
+writers' bits in the same word. Drains require exclusive ownership after joins;
+relaxed atomics do not themselves publish complete multiword payloads. No unsafe
+plain writes or new `AtomicBlob` ordering assumptions were introduced. History
+uses one relaxed cursor reservation per nonempty batch, bounds-checks the range,
+and writes only its reserved indices. Payload atomic stores remain per mesh;
+noncontiguous indices and sorting/duplicate checks still cost CPU. The task vector
+allocates once with capacity 128, never grows in this path; history scratch and
+dirty-mask scratch are fixed stack arrays.
+
+From this directory, `bun test mesh-batching.test.mjs mesh-collection.test.mjs`
+compiles actual production helper/method bodies into isolated Rust fixtures,
+without the blocked enclosing Cargo test workspace. The new fixture executes
+seven Rust tests (including the four existing dirty-helper tests); the preserved
+collection fixture executes three. Coverage includes scalar/batch equivalence,
+noncontiguous writes, duplicate-index history, repeated drains/reuse, concurrent
+same-word writers and history reservations, and stable task-vector capacity.
+A counted cursor verifies 1,024 histories use eight reservations, not 1,024.
+The storage/GPU dependencies are stubs; these tests do not execute full visibility/
+layer routing or verify GPU motion-vector pixels.
+
+One requested cached O3 build and matched headless before/after commands completed:
+`--meshes 10000 --workers 4 --cpu-work 1`, two fresh browser sessions per command,
+readiness-gated warmup (6.04–6.13 s observed) and separate samples (5.01–5.05 s).
+Reports under root `.cache/bevy-web-ecs/render-results/`:
+`2026-11-03T13-05-15.840Z.json` before and
+`2026-11-03T13-08-57.657Z.json` after. Both retain 10,001 meshes/material assets,
+32 CPU lane systems, verified motion/CPU reference and GPU validation.
+
+| Metric | Threaded before → after | Serial before → after |
+| --- | --- | --- |
+| Updates/sec | 12.53 → 12.08 | 12.30 → 12.37 |
+| Sampled total CPU ms/update | 79.60 → 81.96 | 78.02 → 77.43 |
+| Render preparation ms/update | 32.89 → 32.57 | 34.16 → 33.56 |
+| Collection-associated named group ms/update | 12.06 → 10.54 | 11.81 → 10.82 |
+| Collection task wrapper ms/update | 5.64 → 2.92 | 6.23 → 3.82 |
+| Mesh input sparse set / set_batch ms/update | 5.64 → 5.03 | 5.59 → 4.29 |
+| History push_batch ms/update | inlined → 2.27 | inlined → 2.39 |
+| GPU instrumented passes mean ms/frame | 0.1127 → 0.1131 | 0.1127 → 0.1125 |
+
+The named group uses captured named stack frames for collection/task wrappers,
+builder preparation, mesh-input sparse writes and history batches; each sample
+is attributed exclusively through the existing contributor analysis. Unrelated
+system wrappers merely mentioning input-buffer parameter types are excluded.
+This is a named attribution group, not an exact collection timer, and inlined
+work can move between names after batching. No old Wasm indices were remapped
+using the rebuilt binary. Profiler sampling, about 61–63 updates per case and
+unrelated CPU variation limit the comparison. The localized group decreased,
+but this pair demonstrates **no end-to-end gain**; threaded cadence worsened.
+GPU times exclude copies/uninstrumented passes, and cadence is not presentation.
+
+## Task-local mesh geometry lookup cache (2026-11-03)
+
+Collection workers now retain the last mesh's vertex/index/metadata allocation
+ranges for the lifetime of one task. The allocator is immutably borrowed during
+collection; each invocation creates fresh caches, so allocation changes, missing
+meshes becoming available and reused asset IDs cannot retain prior-frame ranges.
+There is no heap allocation or shared cache lock. Alternating mesh IDs miss normally.
+Transforms, history pushes, materials, skins, morphs, lightmaps and instance flags
+are not cached. Existing sparse/culling optimizations remain unchanged.
+
+`bun test mesh-collection.test.mjs` compiles the production cache, preparation,
+update and removal functions with CPU fixtures outside the enclosing Cargo
+workspace. Three Rust tests cover mixed indexed/nonindexed/missing geometry,
+changing instance metadata and transforms, missing materials, previous-transform
+history, removal/recycled slots, frame-local invalidation and independent workers.
+Four workers preparing 10,000 identical mesh IDs each perform 12 allocator calls
+rather than 120,000; cache storage is at most 64 bytes per worker. These checks do
+not execute the complete visibility/layer-routing systems or GPU motion vectors.
+
+Matched headless runs used `--meshes 10000 --workers 4 --cpu-work 1`, fresh browser
+profiles, readiness-dependent warmup and sampling, with unchanged O3 configuration.
+Before report: `2026-11-03T12-52-24.851Z.json`; after:
+`2026-11-03T12-56-17.168Z.json`, both under root
+`.cache/bevy-web-ecs/render-results/`.
+
+| Metric | Threaded before → after | Serial before → after |
+| --- | --- | --- |
+| Updates/sec | 11.55 → 12.36 | 11.66 → 11.97 |
+| Sampled total CPU ms/update | 87.35 → 79.86 | 81.85 → 79.34 |
+| Render preparation ms/update | 35.40 → 32.09 | 35.90 → 35.72 |
+| Collection-associated named group ms/update | 11.41 → 11.49 | 12.92 → 11.69 |
+| Collection task wrapper ms/update | 6.82 → 6.70 | 8.05 → 7.08 |
+| Mesh input sparse set ms/update | 3.75 → 3.99 | 4.19 → 4.28 |
+| GPU instrumented passes mean ms/frame | 0.1132 → 0.1128 | 0.1130 → 0.1125 |
+
+The named group sums collection/task-wrapper, builder preparation, mesh-input set
+and culling-bound set attribution; it is not exact function self time. The wrapper
+contains real work. One matched pair does not establish a repeatable high-impact
+collection speedup: threaded collection was effectively unchanged, serial improved,
+and unrelated categories varied. The deterministic result is eliminated repeated
+allocator lookups, not proof that all observed cadence/CPU changes came from this
+cache. No further speculative optimization was stacked on this result.
+
 ## Mesh collection / sparse-buffer experiment (2026-11-03)
 
 This focused change skips byte-identical model-space culling-bound writes in both

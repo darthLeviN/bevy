@@ -402,6 +402,11 @@ where
         self.buffer.set(uniform_index, element);
     }
 
+    /// Writes a bounded batch of existing indices; see [`AtomicSparseBufferVec::set_batch`].
+    pub fn set_batch(&self, entries: &[(u32, BDI)]) {
+        self.buffer.set_batch(entries);
+    }
+
     // Ensures that the buffers are nonempty, which the GPU requires before an
     // upload can take place.
     pub fn ensure_nonempty(&mut self) {
@@ -509,6 +514,24 @@ where
             "push exceeded pre-allocated capacity"
         );
         self.buffer.set(index, value);
+        index
+    }
+
+    /// Appends a batch with one atomic reservation and returns its first index.
+    /// Capacity must have been reserved before sharing this buffer. The returned
+    /// range is private to this call, but its values are published only after the
+    /// caller's worker joins, just like [`Self::push`]. Empty batches reserve nothing.
+    pub fn push_batch(&self, values: &[BPDI]) -> u32 {
+        if values.is_empty() {
+            return self.atomic_len.load(Ordering::Relaxed);
+        }
+        let count = u32::try_from(values.len()).expect("history batch too large");
+        let index = self.atomic_len.fetch_add(count, Ordering::Relaxed);
+        assert!(index.checked_add(count).is_some_and(|end| end <= self.buffer.len()),
+            "history batch exceeded pre-allocated capacity");
+        for (offset, value) in values.iter().enumerate() {
+            self.buffer.set(index + offset as u32, *value);
+        }
         index
     }
 

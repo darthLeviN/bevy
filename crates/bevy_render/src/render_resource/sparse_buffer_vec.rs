@@ -555,6 +555,19 @@ where
         self.note_changed_index(index);
     }
 
+    /// Writes at most 128 existing entries, marking each dirty word once.
+    /// Duplicate indices are written in slice order. Synchronization is the same
+    /// as [`Self::set`]; upload must wait for all writers to finish.
+    pub fn set_batch(&self, entries: &[(u32, T)]) {
+        assert!(entries.len() <= 128);
+        for (index, value) in entries {
+            value.write_to_blob(&self.values[*index as usize]);
+        }
+        sparse_buffer_dirty::note_changed_batch(
+            entries.iter().map(|entry| entry.0), &self.summary, &self.dirty_bits,
+        );
+    }
+
     /// Sets an existing value only if its bytes differ, preserving NaN payloads
     /// and signed zero. Unchanged values retain their existing dirty state.
     ///
