@@ -55,6 +55,120 @@ fn gpu_affine_queries_use_direct_iteration_not_local_task_batches() {
 }
 
 #[test]
+fn automatic_small_queries_avoid_dispatch_but_fixed_and_large_queries_keep_batches() {
+    use bevy_ecs::{batching::BatchingStrategy, prelude::*};
+    use bevy_tasks::ComputeTaskPool;
+    use std::sync::{atomic::{AtomicUsize, Ordering}, Barrier, Mutex};
+
+    #[derive(Component)]
+    struct Value(u32);
+    #[derive(Component)]
+    #[component(storage = "SparseSet")]
+    struct Sparse;
+
+    let pool = ComputeTaskPool::get_or_init(|| TaskPoolBuilder::new().num_threads(2).build());
+    let owner = std::thread::current().id();
+    for count in 0..=pool.scope_thread_num() {
+        let mut world = World::new();
+        for _ in 0..count { world.spawn((Value(0), Sparse)); }
+        let initializers = AtomicUsize::new(0);
+        world.query::<&mut Value>().par_iter_mut(&mut world).for_each_init(
+            || { initializers.fetch_add(1, Ordering::Relaxed); },
+            |_, mut value| {
+                assert_eq!(std::thread::current().id(), owner);
+                value.0 += 1;
+            },
+        );
+        assert_eq!(initializers.load(Ordering::Relaxed), 1);
+        initializers.store(0, Ordering::Relaxed);
+        world.query_filtered::<&mut Value, With<Sparse>>().par_iter_mut(&mut world).for_each_init(
+            || { initializers.fetch_add(1, Ordering::Relaxed); },
+            |_, mut value| {
+                assert_eq!(std::thread::current().id(), owner);
+                value.0 += 1;
+            },
+        );
+        assert_eq!(initializers.load(Ordering::Relaxed), 1);
+        assert!(world.query::<&Value>().iter(&world).all(|value| value.0 == 2));
+    }
+
+    let mut world = World::new();
+    world.spawn(Value(0));
+    world.spawn(Value(0));
+    let initializers = AtomicUsize::new(0);
+    world.query::<&mut Value>().par_iter_mut(&mut world)
+        .batching_strategy(BatchingStrategy::fixed(1))
+        .for_each_init(|| { initializers.fetch_add(1, Ordering::Relaxed); }, |_, mut value| value.0 += 1);
+    assert_eq!(initializers.load(Ordering::Relaxed), 2, "fixed batches must retain explicit dispatch");
+
+    for _ in 2..16_384 { world.spawn(Value(0)); }
+    let barrier = Barrier::new(2);
+    let threads = Mutex::new(std::collections::HashSet::new());
+    initializers.store(0, Ordering::Relaxed);
+    world.query::<&mut Value>().par_iter_mut(&mut world).for_each_init(
+        || {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            if initializers.fetch_add(1, Ordering::Relaxed) < 2 { barrier.wait(); }
+        },
+        |_, mut value| value.0 += 1,
+    );
+    assert!(threads.into_inner().unwrap().len() >= 2, "large queries must execute concurrently");
+    assert_eq!(world.query::<&Value>().iter(&world).map(|value| value.0 as usize).sum::<usize>(), 16_386);
+}
+
+#[test]
+fn scope_cleanup_handles_empty_drained_and_unwinding_queues() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Dropped<'a>(&'a AtomicUsize);
+    impl Drop for Dropped<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let pool = TaskPoolBuilder::new().num_threads(2).build();
+    let empty: Vec<()> = pool.scope(|_| {});
+    assert!(empty.is_empty());
+
+    let completed = AtomicUsize::new(0);
+    let results = pool.scope(|scope| {
+        for value in 0..4 {
+            let dropped = Dropped(&completed);
+            scope.spawn(async move {
+                drop(dropped);
+                value
+            });
+        }
+    });
+    assert_eq!(results.iter().sum::<usize>(), 6);
+    assert_eq!(completed.load(Ordering::Relaxed), 4);
+
+    let cancelled = AtomicUsize::new(0);
+    let (started, ready) = std::sync::mpsc::channel();
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pool.scope::<_, ()>(|scope| {
+            for _ in 0..4 {
+                let dropped = Dropped(&cancelled);
+                let started = started.clone();
+                scope.spawn(async move {
+                    started.send(()).unwrap();
+                    core::future::pending::<()>().await;
+                    drop(dropped);
+                });
+            }
+            for _ in 0..4 {
+                ready.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            }
+            panic!("exercise cancellation of queued scoped tasks");
+        });
+    }));
+    assert!(unwind.is_err());
+    assert_eq!(cancelled.load(Ordering::Relaxed), 4, "unwinding must still cancel and drop every queued future");
+    assert_eq!(pool.scope(|scope| { scope.spawn(async { 7 }); }), vec![7]);
+}
+
+#[test]
 fn caller_can_execute_cpu_tasks_while_all_workers_are_busy() {
     use std::sync::{Arc, Mutex, Condvar, mpsc};
     struct Release(Arc<(Mutex<bool>, Condvar)>);

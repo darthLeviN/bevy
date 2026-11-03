@@ -759,6 +759,11 @@ where
     T: 'scope,
 {
     fn drop(&mut self) {
+        // Successful scopes have already drained every task. Avoid entering
+        // block_on (and its browser worker-failure check) when nothing remains.
+        if self.spawned.is_empty() {
+            return;
+        }
         block_on(async {
             while let Ok(task) = self.spawned.pop() {
                 task.cancel().await;

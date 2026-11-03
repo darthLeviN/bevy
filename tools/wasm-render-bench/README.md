@@ -124,6 +124,26 @@ passed. The updated O3 artifact and wasm-bindgen output were built successfully
 with two build jobs and the existing isolated target cache. These checks do not
 measure the FPS effect; no browser run was performed for these corrections.
 
+### Follow-up subagent optimizations after the WIP checkpoint
+
+WIP checkpoints: Space Maker `df6f8c3`, Bevy `1afafd2`. Subsequent optimization work
+remains separate from those checkpoints.
+
+- Ordinary automatically batched `QueryParIter` now accumulates total matched
+  rows during its existing storage-metadata sizing scan. It avoids a task scope
+  when work fits one calculated batch or an automatic query has at most one row
+  per compute worker. No additional entity scan is introduced. Explicit fixed
+  batches retain their requested dispatch; contiguous/entity-list iterators are
+  unchanged by this follow-up.
+- `Scope::drop` skips `block_on` when its task queue is already empty. Pending
+  tasks still take the original cancellation path.
+
+Five native integration tests passed, covering small dense/sparse queries,
+explicit fixed dispatch, concurrent 16,384-entity iteration, GPU affinity, caller
+participation, and empty/completed/panic-unwinding scope cleanup. The O3 artifact
+and wasm-bindgen output were rebuilt successfully using the existing isolated
+cache and two jobs. No browser run or FPS-parity claim was made for these changes.
+
 ### Earlier failures and supporting changes
 
 The first O3 comparison measured serial application cadence at 296.48 FPS.

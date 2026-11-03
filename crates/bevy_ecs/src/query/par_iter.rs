@@ -103,7 +103,12 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
         #[cfg(all(any(not(target_arch = "wasm32"), feature = "wasm_threads"), feature = "multi_threaded"))]
         {
             let thread_count = bevy_tasks::ComputeTaskPool::get().scope_thread_num();
-            if thread_count <= 1 {
+            let (batch_size, run_directly) = if thread_count <= 1 {
+                (1, true)
+            } else {
+                self.get_batch_size(thread_count)
+            };
+            if run_directly {
                 let init = init();
                 // SAFETY: See the safety comment above.
                 unsafe {
@@ -114,7 +119,7 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
                 }
             } else {
                 // Need a batch size of at least 1.
-                let batch_size = self.get_batch_size(thread_count).max(1);
+                let batch_size = batch_size.max(1);
                 // SAFETY: See the safety comment above.
                 unsafe {
                     self.state.par_fold_init_unchecked_manual(
@@ -131,28 +136,42 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
     }
 
     #[cfg(all(any(not(target_arch = "wasm32"), feature = "wasm_threads"), feature = "multi_threaded"))]
-    fn get_batch_size(&self, thread_count: usize) -> u32 {
+    fn get_batch_size(&self, thread_count: usize) -> (u32, bool) {
+        let mut total_items = None;
         let max_items = || {
+            let mut total = 0usize;
             let id_iter = self.state.matched_storage_ids.iter();
-            if self.state.is_dense {
+            let max = if self.state.is_dense {
                 // SAFETY: We only access table metadata.
                 let tables = unsafe { &self.world.world_metadata().storages().tables };
                 id_iter
                     // SAFETY: The if check ensures that matched_storage_ids stores TableIds
                     .map(|id| unsafe { tables[id.table_id].entity_count() })
+                    .inspect(|count| total += *count as usize)
                     .max()
             } else {
                 let archetypes = &self.world.archetypes();
                 id_iter
                     // SAFETY: The if check ensures that matched_storage_ids stores ArchetypeIds
                     .map(|id| unsafe { archetypes[id.archetype_id].len() })
+                    .inspect(|count| total += *count as usize)
                     .max()
             }
             .map(|v| v as usize)
-            .unwrap_or(0)
+            .unwrap_or(0);
+            total_items = Some(total);
+            max
         };
-        self.batching_strategy
-            .calc_batch_size(max_items, thread_count) as u32
+        let batch_size = self.batching_strategy.calc_batch_size(max_items, thread_count);
+        // Reuse the sizing scan: don't queue jobs for an automatic query with
+        // at most one row per worker, or work that already fits in one batch.
+        // Fixed batches skip the scan and retain their explicit dispatch intent.
+        let run_directly = total_items.is_some_and(|total| {
+            total <= batch_size || (total <= thread_count
+                && self.batching_strategy.batch_size_limits.start == 1
+                && self.batching_strategy.batches_per_thread == 1)
+        });
+        (batch_size as u32, run_directly)
     }
 }
 
