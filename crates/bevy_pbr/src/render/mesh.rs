@@ -1676,7 +1676,7 @@ impl MeshCullingData {
         while mesh_culling_data_buffer.len() < instance_data_index + 1 {
             mesh_culling_data_buffer.push(MeshCullingData::default());
         }
-        mesh_culling_data_buffer.set(instance_data_index, *self);
+        mesh_culling_data_buffer.set_if_changed_bytes(instance_data_index, *self);
     }
 }
 
@@ -2690,8 +2690,10 @@ pub fn collect_meshes_for_gpu_building(
 
                                 current_input_buffer
                                     .set(current_uniform_index, prepared.mesh_input_uniform);
+                                // Bounds are model-space: moving the instance doesn't
+                                // require another culling-buffer upload.
                                 mesh_culling_data_buffer
-                                    .set(current_uniform_index, mesh_culling_builder);
+                                    .set_if_changed_bytes(current_uniform_index, mesh_culling_builder);
                             }
 
                             for entity in removed.drain(..) {

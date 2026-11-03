@@ -1,6 +1,10 @@
 //! GPU buffers that support sparse updates if only a small number of elements
 //! have changed.
 
+#[path = "sparse_buffer_dirty.rs"]
+mod sparse_buffer_dirty;
+use sparse_buffer_dirty::note_changed_index;
+
 use alloc::sync::{Arc, Weak};
 use core::{
     slice,
@@ -551,6 +555,20 @@ where
         self.note_changed_index(index);
     }
 
+    /// Sets an existing value only if its bytes differ, preserving NaN payloads
+    /// and signed zero. Unchanged values retain their existing dirty state.
+    ///
+    /// This has the same synchronization requirements as [`Self::set`]. It is
+    /// intended for single-writer-per-index updates whose values often repeat.
+    pub fn set_if_changed_bytes(&self, index: u32, value: T) {
+        let previous = self.get(index);
+        sparse_buffer_dirty::write_if_changed(
+            bytemuck::bytes_of(&previous),
+            bytemuck::bytes_of(&value),
+            || self.set(index, value),
+        );
+    }
+
     /// Adds a new value and returns its index.
     pub fn push(&mut self, value: T) -> u32 {
         let index = self.values.len() as u32;
@@ -938,16 +956,7 @@ fn set_dirty_bits_for_vector_growth(
 ///
 /// This is a separate function so we can unit test it easily (i.e. without the
 /// need of a `RenderDevice`).
-fn note_changed_index(index: u32, summary: &[AtomicU64], dirty_bits: &[AtomicU64]) {
-    let dirty_word_index = index / BITS_PER_WORD;
-    let (summary_word_index, summary_bit_offset) = (
-        dirty_word_index / BITS_PER_WORD,
-        dirty_word_index % BITS_PER_WORD,
-    );
-    summary[summary_word_index as usize].fetch_or(1 << summary_bit_offset, Ordering::Relaxed);
-    let (element_word, element_in_word) = (index / BITS_PER_WORD, index % BITS_PER_WORD);
-    dirty_bits[element_word as usize].fetch_or(1 << element_in_word, Ordering::Relaxed);
-}
+
 
 /// Returns the total number of bits set in `dirty_bits`, using the given
 /// `summary` to accelerate the count.
