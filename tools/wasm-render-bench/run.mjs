@@ -36,6 +36,12 @@ export function formatSummary(report) {
           return [`\n${result.mode}/${result.requested_workers} — exclusive sampled CPU ms/update`,
             'Operation                         Main   Workers     Total  Samples',
             ...breakdown.rows.map(row => `${row.label.padEnd(32)} ${number(row.main_cpu_ms_per_update).padStart(7)} ${number(row.workers_cpu_ms_per_update).padStart(9)} ${number(row.total_cpu_ms_per_update).padStart(9)} ${String(row.samples).padStart(8)}`),
+            ...(breakdown.command_breakdown ? [
+              '  Command encoding / submission detail (children only; do not add to broad rows)',
+              'Operation                                      Main   Workers     Total  Samples',
+              ...breakdown.command_breakdown.rows.map(row => `${row.label.padEnd(43)} ${row.main_cpu_ms_per_update.toFixed(4).padStart(8)} ${row.workers_cpu_ms_per_update.toFixed(4).padStart(9)} ${row.total_cpu_ms_per_update.toFixed(4).padStart(9)} ${String(row.samples).padStart(8)}`),
+            ] : []),
+            `Unresolved Wasm-index samples before attribution: ${result.cpu_execution.coverage?.unresolved_symbol_samples ?? 'unavailable'}`,
             breakdown.limitation];
         }),
   ].join('\n');

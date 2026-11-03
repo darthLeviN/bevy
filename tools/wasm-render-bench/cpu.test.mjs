@@ -46,6 +46,30 @@ test('sampled application CPU weights actual raw Gecko stacks by deltas and sepa
   expect(cpu.breakdown.rows.find(row => row.id === 'unclassified').samples).toBe(2);
 });
 
+test('command children conserve parent OS CPU and samples independently in both roles', () => {
+  const profile = withStacks(fixture());
+  for (const t of profile.processes[0].threads) {
+    t.stringTable[1] = 'wasm-function[7]';
+    t.stringTable[2] = 'wasm-function[8]';
+  }
+  const cpu = cpuAccounting(profile, result, new Map([
+    [7, '<wgpu::backend::webgpu::WebDevice as wgpu::dispatch::DeviceInterface>::create_bind_group'],
+    [8, 'wgpu::backend::webgpu::unknown_operation'],
+  ])).application_cpu;
+  const parent = cpu.breakdown.rows.find(row => row.id === 'render_commands');
+  const children = cpu.breakdown.command_breakdown.rows;
+  for (const key of ['main_cpu_ms', 'workers_cpu_ms', 'total_cpu_ms', 'main_cpu_ms_per_update', 'workers_cpu_ms_per_update', 'total_cpu_ms_per_update', 'samples']) {
+    expect(children.reduce((sum, row) => sum + row[key], 0)).toBeCloseTo(parent[key], 12);
+  }
+  expect(children.find(row => row.id === 'resource_creation').samples).toBe(2);
+  expect(children.find(row => row.id === 'encoding_other').samples).toBe(2);
+  expect(cpu.breakdown.rows.reduce((sum, row) => sum + row.total_cpu_ms, 0)).toBe(cpu.total_cpu_ms);
+  expect(cpu.coverage.unresolved_symbol_samples).toBe(0);
+  const unresolved = cpuAccounting(profile, result).application_cpu;
+  expect(unresolved.coverage.unresolved_symbol_samples).toBe(4);
+  expect(unresolved.breakdown.rows.find(row => row.id === 'unclassified').samples).toBe(4);
+});
+
 test('missing stacks and no identifiable Wasm are unavailable, not application zero', () => {
   for (const mutate of [
     p => { delete p.processes[0].threads[1].stackTable; },

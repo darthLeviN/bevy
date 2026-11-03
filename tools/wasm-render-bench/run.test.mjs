@@ -264,6 +264,9 @@ test('default runner automatically prints sampled app CPU for both cases from ca
   expect(fake.saved[0].results[0].cpu_execution.supported).toBe(true);
   expect(logs).toContain('Full benchmark report: fake.json');
   expect(logs.at(-1)).toBe(formatSummary(report));
+  expect(logs.at(-1)).toContain('children only; do not add to broad rows');
+  expect(logs.at(-1)).toContain('Encoding / backend other (unresolved)');
+  expect(logs.at(-1)).toContain('Unresolved Wasm-index samples before attribution:');
   expect(logs.at(-1)).toMatch(/threaded\s+8\s+0\.00\s+0\.02\s+0\.02\s+unavailable\s+100\.00/);
   expect(logs.at(-1)).toMatch(/serial\s+0\s+0\.00\s+0\.00\s+0\.00\s+unavailable\s+100\.00/);
   expect(logs.at(-1)).not.toMatch(/stack_coverage|Other_or_unclassified|Wasm_samples/);

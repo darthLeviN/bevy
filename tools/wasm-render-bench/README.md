@@ -307,6 +307,41 @@ Missing binary names are recorded in JSON and do not manufacture stage timings.
 No performance markers, wall-duration apportionment or additional runtime hooks
 are required, so capture settings and workload semantics remain unchanged.
 
+`cpu_execution.breakdown.command_breakdown` refines **only** the existing
+`render_commands` parent: uploads/writes/copies; pipeline/binding/resource creation;
+render/compute pass begin/end; draw/dispatch/binding state; encoder creation/finish;
+queue submission; buffer mapping/readback; named backend conversions/capabilities;
+and explicit encoding/backend other. Each child includes main/worker/total CPU
+ms/update and sample counts. Children sum to the parent independently for each
+role and must **not** be added to the broad rows. Resource work already attributed
+to asset/material preparation or another broad category is not moved here.
+
+Child attribution uses the same innermost recognized frame as its parent. Rules
+require qualified GPU receiver/method names (including demangled crate hashes,
+legacy Rust names, and WebGPU generated bindings); generic `wgpu`, `submit`,
+`finish`, or `end` substrings do not establish queue submission or pass work.
+An opaque backend helper is not reassigned to an outer submission frame.
+`map_wgt_features`, `map_wgt_limits`, and `map_texture_format` are labeled by their
+symbol names, not interpreted as independently timed stages. Inlining, optimized
+symbol aliases, truncated names, and generic wrappers can conceal actual work;
+backend-other and zero-sample rows are not estimates of missing operations.
+Coverage records `unresolved_symbol_samples`: samples encountering an unresolved
+`wasm-function[N]` before reaching their attribution frame (not all unnamed native
+frames or a count of unique missing symbols).
+
+The authorized headless one-mesh/four-worker/CPU-work-1 capture
+`2026-11-03T10-50-35.468Z.json` measured command-parent CPU of 0.6980/0.6413
+ms/update threaded/serial, with 93/82 samples. Resource creation accounted for
+0.2091/0.1882; queue submission for 0.0227/0.0079 (only 3/1 samples);
+backend conversions for 0.1131/0.1170; backend-other for 0.1347/0.1014.
+These are statistical symbol attributions from one profiled run, not exact stage
+latencies or evidence that the threaded/serial differences are significant.
+
+Focused checks: `bun test src/bevy/tools/wasm-render-bench/breakdown.test.mjs src/bevy/tools/wasm-render-bench/cpu.test.mjs src/bevy/tools/wasm-render-bench/run.test.mjs src/bevy/tools/wasm-render-bench/capture.test.mjs`.
+They cover realistic captured symbols, raw index resolution, method-name
+collisions, broad-category precedence, per-role parent/child CPU and sample
+conservation, and human-readable hierarchical reporting.
+
 The default runner no longer installs wall-time boundary schedules or emits
 `schedule_timings`. It controls Firefox's supported `nsIProfiler` API and captures
 `GeckoMain` and `DOM Worker` threads. Profiles are saved beside the result JSON

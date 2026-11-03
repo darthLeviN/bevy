@@ -1,12 +1,13 @@
 import { processes, cpuMillisecondsPerUnit, hasWasmFrame } from '../../../../editor-benchmark/profile.mjs';
 
-import { stackCategory, cpuBreakdown } from './breakdown.mjs';
+import { stackAttribution, cpuBreakdown } from './breakdown.mjs';
 
 function sampledApplicationCpu(threads, updates) {
   const sum = key => threads.reduce((total, row) => total + row[key], 0);
   const coverage = {
     samples: sum('samples'), stack_samples: sum('stack_samples'), wasm_samples: sum('wasm_samples'),
     captured_threads: threads.length,
+        unresolved_symbol_samples: sum('unresolved_symbol_samples'),
     threads_with_stacks: threads.filter(row => row.stack_samples > 0).length,
     other_or_unclassified_cpu_ms: sum('other_or_unclassified_cpu_ms'),
     missing_stack_cpu_ms: sum('missing_stack_cpu_ms'),
@@ -77,8 +78,8 @@ export function cpuAccounting(profile, result, functionNames = new Map()) {
     const data = thread.samples?.data;
     if (schema?.threadCPUDelta === undefined || !data?.length) return unavailable('Firefox OS thread CPU deltas unavailable');
     let cpuDelta = 0, previous, first, last, boundaryMaxMs = 0, count = 0;
-    let wasmDelta = 0, missingStackDelta = 0, stackSamples = 0, wasmSamples = 0;
-    const stacks = new Map(), categoryCache = new Map(), categories = {};
+    let wasmDelta = 0, missingStackDelta = 0, stackSamples = 0, wasmSamples = 0, unresolvedSymbolSamples = 0;
+    const stacks = new Map(), categoryCache = new Map(), categories = {}, commandCategories = {};
     for (const sample of data) {
       const time = sample[schema.time];
       if (!Number.isFinite(time) || (previous !== undefined && time <= previous)) {
@@ -97,11 +98,17 @@ export function cpuAccounting(profile, result, functionNames = new Map()) {
         else stackSamples++;
         if (wasm === true) {
                   wasmDelta += delta; wasmSamples++;
-                  if (!categoryCache.has(stack)) categoryCache.set(stack, stackCategory(thread, stack, functionNames));
-                  const category = categoryCache.get(stack);
+                  if (!categoryCache.has(stack)) categoryCache.set(stack, stackAttribution(thread, stack, functionNames));
+                  const { category, command, unresolved } = categoryCache.get(stack);
+                                    if (unresolved) unresolvedSymbolSamples++;
                   const entry = categories[category] ??= { cpu_ms: 0, samples: 0 };
                   entry.cpu_ms += delta * millisecondsPerUnit;
                   entry.samples++;
+                  if (command) {
+                    const child = commandCategories[command] ??= { cpu_ms: 0, samples: 0 };
+                    child.cpu_ms += delta * millisecondsPerUnit;
+                    child.samples++;
+                  }
                 }
         first ??= previous;
         last = time;
@@ -116,11 +123,11 @@ export function cpuAccounting(profile, result, functionNames = new Map()) {
       return unavailable('Profiler samples do not cover the complete CPU window');
     }
     rows.push({ pid: thread.pid, tid: thread.tid, name: thread.name,
-      role: thread === main ? 'main' : 'worker', categories, cpu_ms: cpuDelta * millisecondsPerUnit,
+      role: thread === main ? 'main' : 'worker', categories, command_categories: commandCategories, cpu_ms: cpuDelta * millisecondsPerUnit,
       sampled_wasm_cpu_ms: wasmDelta * millisecondsPerUnit,
       other_or_unclassified_cpu_ms: (cpuDelta - wasmDelta) * millisecondsPerUnit,
       missing_stack_cpu_ms: missingStackDelta * millisecondsPerUnit,
-      stack_samples: stackSamples, wasm_samples: wasmSamples,
+      stack_samples: stackSamples, wasm_samples: wasmSamples, unresolved_symbol_samples: unresolvedSymbolSamples,
       samples: count, covered_start_ms: first, covered_end_ms: last,
       omitted_boundary_upper_bound_ms: boundaryMaxMs });
   }

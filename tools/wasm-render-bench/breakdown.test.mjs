@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { stackCategory, cpuBreakdown, wasmFunctionNames } from './breakdown.mjs';
+import { stackCategory, stackAttribution, commandCategory, cpuBreakdown, wasmFunctionNames } from './breakdown.mjs';
 
 function thread(labels) {
   return { stringTable: labels, frameTable: { schema: { location: 0 }, data: labels.map((_, i) => [i]) },
@@ -29,6 +29,43 @@ test('CPU breakdown conserves exclusive role totals including unclassified and s
   expect(result.rows.reduce((s, r) => s + r.main_cpu_ms_per_update, 0)).toBe(5);
   expect(result.rows.reduce((s, r) => s + r.workers_cpu_ms_per_update, 0)).toBe(2);
   expect(result.rows.reduce((s, r) => s + r.samples, 0)).toBe(7);
+});
+
+test('captured Firefox demangled and legacy Rust operations classify by receiver and method', () => {
+  const cases = [
+    ['<wgpu[7671c6e8c24c6970]::backend::webgpu::WebDevice as wgpu[7671c6e8c24c6970]::dispatch::DeviceInterface>::create_bind_group', 'resource_creation'],
+    ['<wgpu::api::device::Device as wgpu::util::device::DeviceExt>::create_buffer_init', 'resource_creation'],
+    ['<wgpu::backend::webgpu::webgpu_sys::gen_GpuQueue::GpuQueue>::write_buffer_with_f64_and_u8_slice_and_f64_and_f64::__wbg_writeBuffer_8b5bd251a89198bc externref shim', 'uploads_copies'],
+    ['<wgpu::backend::webgpu::WebCommandEncoder as wgpu::dispatch::CommandEncoderInterface>::begin_render_pass::{closure#0}', 'pass_boundaries'],
+    ['<wgpu::backend::webgpu::WebComputePassEncoder as wgpu::dispatch::ComputePassInterface>::end', 'pass_boundaries'],
+    ['<wgpu::api::render_pass::RenderPass>::draw', 'draw_dispatch_state'],
+    ['<wgpu::backend::webgpu::WebRenderPassEncoder as wgpu::dispatch::RenderPassInterface>::set_bind_group', 'draw_dispatch_state'],
+    ['<wgpu::api::command_encoder::CommandEncoder>::finish', 'encoder_lifecycle'],
+    ['<wgpu::backend::webgpu::webgpu_sys::gen_GpuDevice::GpuDevice>::create_command_encoder_with_descriptor', 'encoder_lifecycle'],
+    ['GPUQueue.submit', 'queue_submission'],
+    ['_ZN4wgpu3api5queue5Queue6submit17h0123456789abcdefE', 'queue_submission'],
+    ['<wgpu::api::command_encoder::CommandEncoder>::map_buffer_on_submit', 'buffer_mapping'],
+    ['wgpu[7671c6e8c24c6970]::backend::webgpu::map_wgt_features', 'backend_conversion'],
+    ['wgpu::backend::webgpu::register_then_closures', 'encoding_other'],
+    ['PWebGPU::Msg_Messages', 'encoding_other'],
+    ['other::Queue::submit', 'encoding_other'],
+    ['other::Thing<wgpu::Buffer>::create_buffer', 'encoding_other'],
+    ['other::Queue<wgpu::Buffer>::submit', 'encoding_other'],
+    ['wgpu::Device::finish', 'encoding_other'],
+    ['wgpu::Buffer::end', 'encoding_other'],
+    ['wgpu::Queue::submit_pending', 'encoding_other'],
+    ['wgpu::CommandEncoder::finish_frame', 'encoding_other'],
+  ];
+  for (const [symbol, expected] of cases) expect(commandCategory(symbol)).toBe(expected);
+});
+
+test('children never steal another broad category or replace an innermost generic backend with submission', () => {
+  const t = thread(['wgpu::Queue::submit', 'wgpu::backend::webgpu::register_then_closures']);
+  expect(stackAttribution(t, 1)).toMatchObject({ category: 'render_commands', command: 'encoding_other' });
+  const preparation = thread(['wgpu::Queue::submit', 'bevy_render::prepare_bind_group']);
+  expect(stackAttribution(preparation, 1)).toMatchObject({ category: 'render_preparation', command: undefined });
+  const unresolved = thread(['wgpu::Queue::submit', 'wasm-function[999]']);
+  expect(stackAttribution(unresolved, 1)).toMatchObject({ category: 'render_commands', command: 'queue_submission', unresolved: true });
 });
 
 test('reads function indexes from Wasm custom name section without executing module', () => {
