@@ -5,7 +5,7 @@ import { cpuAccounting } from './cpu.mjs';
 import { stackAttribution, commandCategory, wasmFunctionNames } from './breakdown.mjs';
 
 // Preserve complete leaf-to-root evidence: an attributed ancestor is not self CPU.
-export function conversionContributors(profile, result, names) {
+export function conversionContributors(profile, result, names, category = 'backend_conversion') {
   const accounting = cpuAccounting(profile, result, names);
   if (!accounting.supported) throw Error(accounting.reason);
   const rows = new Map();
@@ -17,7 +17,7 @@ export function conversionContributors(profile, result, names) {
     for (const sample of thread.samples.data) {
       const time = sample[schema.time];
       if (previous >= accounting.start_ms && time <= accounting.end_ms &&
-          stackAttribution(thread, sample[schema.stack], names).command === 'backend_conversion') {
+          stackAttribution(thread, sample[schema.stack], names).command === category) {
         const labels = [], seen = new Set();
         let stack = sample[schema.stack];
         while (stack != null && !seen.has(stack)) {
@@ -31,7 +31,7 @@ export function conversionContributors(profile, result, names) {
           stack = row[thread.stackTable.schema.prefix];
         }
         const key = JSON.stringify([thread.tid, labels]);
-        const symbol = labels.find(frame => commandCategory(frame.symbol) === 'backend_conversion')?.symbol;
+        const symbol = labels.find(frame => commandCategory(frame.symbol) === category)?.symbol;
                 const entry = rows.get(key) ?? { tid: thread.tid, name: thread.name, symbol, samples: 0, cpu_ms: 0, stack: labels };
         entry.samples++;
         entry.cpu_ms += sample[schema.threadCPUDelta] * unit;
@@ -53,16 +53,16 @@ export function contributorSummary(rows) {
 }
 
 if (import.meta.main) {
-  const [reportPath, wasmPath, detail] = process.argv.slice(2);
-  if (!reportPath || !wasmPath || (detail && detail !== '--full-stacks')) {
-    throw Error('Usage: bun contributors.mjs REPORT.json SERVED.wasm [--full-stacks]');
+  const [reportPath, wasmPath, detail, category = 'backend_conversion'] = process.argv.slice(2);
+  if (!reportPath || !wasmPath || (detail && !['--full-stacks', '--summary'].includes(detail))) {
+    throw Error('Usage: bun contributors.mjs REPORT.json SERVED.wasm [--full-stacks|--summary] [CATEGORY]');
   }
   const report = JSON.parse(readFileSync(reportPath));
   const names = wasmFunctionNames(readFileSync(wasmPath));
   for (const result of report.results) {
     const profile = JSON.parse(readFileSync(result.cpu_profile_path));
-    const rows = conversionContributors(profile, result, names);
-    const evidence = detail ? { stacks: rows } : { top_stacks: rows.slice(0, 3).map(row => ({
+    const rows = conversionContributors(profile, result, names, category);
+    const evidence = detail === '--summary' ? {} : detail ? { stacks: rows } : { top_stacks: rows.slice(0, 3).map(row => ({
       ...row, stack: row.stack.slice(0, row.stack.findIndex(frame => frame.symbol === row.symbol) + 3),
     })) };
     console.log(JSON.stringify({ mode: result.mode, function_names: names.size,

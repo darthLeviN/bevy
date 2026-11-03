@@ -380,6 +380,8 @@ profiles containing raw function indexes):
 ```sh
 bun src/bevy/tools/wasm-render-bench/contributors.mjs REPORT.json SERVED.wasm
 # Add --full-stacks for all weighted leaf-to-root stacks instead of three excerpts.
+# Select creation costs, with bounded symbol-summary output:
+bun src/bevy/tools/wasm-render-bench/contributors.mjs REPORT.json SERVED.wasm --summary resource_creation
 ```
 
 The diagnostic preserves raw labels, resolved symbols, OS weights and boundary
@@ -399,6 +401,58 @@ Focused checks: `bun test src/bevy/tools/wasm-render-bench/breakdown.test.mjs sr
 They cover realistic captured symbols, raw index resolution, method-name
 collisions, broad-category precedence, per-role parent/child CPU and sample
 conservation, and human-readable hierarchical reporting.
+
+#### Non-bindless material uniform reuse
+
+The saved visible report `2026-11-03T11-05-55.257Z.json` attributed
+10.5652 / 11.423 ms per update (threaded / serial) to resource creation.
+Weighted threaded contributors were `DeviceExt::create_buffer_init` 3.3189 ms
+(49 samples), `GPUDevice.createBuffer` 1.2859 (19), `WebDevice::create_buffer`
+0.2030 (3), bind-group entry conversion 1.8974 (28),
+`WebDevice::create_bind_group` 2.5745 (38), and `GPUDevice.createBindGroup`
+1.2856 (19). These are exclusive sampled OS CPU weights, not invocation counts.
+Buffer initialization stacks include `GPUBuffer.unmap` under the non-bindless
+material allocator's `prepare_bind_groups`; this is not recurring pipeline compilation.
+
+The derived `StandardMaterial` path already builds CPU-side `Data` ranges.
+`RenderMaterialBindings::prepare_material` attempted `try_update_data`, but the
+non-bindless allocator always rejected it, freed the previous allocation, and
+queued a replacement. Its preparation then created a new uniform buffer for each
+`Data` binding and a new bind group. Thus changing only color still recreated
+both GPU objects for every changed material.
+
+The non-bindless fast path now checks layout, binding indices/count, resource
+identities/types and uniform sizes before mutating retained bytes. Compatible
+updates retain the material's bind group and uniform buffers; the existing
+`write_material_bind_group_buffers` phase uploads current bytes with
+`Queue::write_buffer`. Resource/layout/size changes still use replacement, and
+shader-buffer identity invalidation still unprepares/rebuilds from current data.
+Freeing a slot clears pending writes. No derive API redesign or benchmark scene,
+CPU workload, material sharing, or frozen-color shortcut was introduced.
+
+One matched headless pair used 1,000 moving meshes, four/zero workers and CPU work
+1, with fresh browsers/profiles, readiness-gated five-second warmup/sample and
+owned cleanup. Baseline: `2026-11-03T11-09-58.250Z.json`; after:
+`2026-11-03T11-12-48.983Z.json` (both repository-root render-results directory).
+
+| Sampled CPU ms/update | Before threaded / serial | After threaded / serial |
+| --- | ---: | ---: |
+| Resource creation | 11.4242 / 10.2385 | 0.2410 / 0.3493 |
+| Render preparation | 4.6300 / 4.02 | 4.39 / 4.16 |
+
+After-run application cadence was 49.13 / 50.58 updates/sec, with total attributed
+application CPU 12.49 / 10.96 ms/update. Both cases passed motion/CPU reference
+validation and retained 1,001 unique materials. One before/after pair does not
+establish repeated-trial significance, physical displayed FPS, or full-editor
+performance. The visible saved report is not a matched headless baseline.
+
+Four contributor tests passed, including exclusive weighted creation attribution
+and retained caller stacks. The cached O3 Wasm build and wasm-bindgen generation
+passed. Added native allocator tests check GPU object identity with wgpu's noop
+backend, layout rejection, pending-write cleanup, 1,000 independent changing byte
+states, and atomic rejection of binding/size changes. Their execution remains
+blocked before compilation by the existing multiple-workspace-roots Cargo error;
+no native-test success is claimed and workspace repair is outside this change.
 
 The default runner no longer installs wall-time boundary schedules or emits
 `schedule_timings`. It controls Firefox's supported `nsIProfiler` API and captures

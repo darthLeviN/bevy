@@ -234,6 +234,8 @@ pub struct MaterialBindGroupNonBindlessAllocator {
     to_prepare: HashSet<MaterialBindGroupIndex>,
     /// A list of free bind group indices.
     free_indices: Vec<MaterialBindGroupIndex>,
+    /// Prepared groups whose retained uniform bytes need uploading.
+    dirty_uniforms: HashSet<MaterialBindGroupIndex>,
 }
 
 /// A single bind group that a [`MaterialBindGroupNonBindlessAllocator`] is
@@ -262,7 +264,7 @@ enum MaterialNonBindlessAllocatedBindGroup {
         /// invalid.
         layout: BindGroupLayoutDescriptor,
         /// Uniform buffers referenced by the bind group.
-        #[expect(dead_code, reason = "These buffers are only referenced by bind groups")]
+
         uniform_buffers: Vec<Buffer>,
     },
 }
@@ -673,15 +675,15 @@ impl MaterialBindGroupAllocator {
         &mut self,
         existing_binding_id: MaterialBindingId,
         unprepared_bind_group: &mut BindGroupBuilder,
+        layout: &BindGroupLayoutDescriptor,
     ) -> bool {
         match *self {
             MaterialBindGroupAllocator::Bindless(
                 ref mut material_bind_group_bindless_allocator,
             ) => material_bind_group_bindless_allocator
                 .try_update_data(existing_binding_id, unprepared_bind_group),
-            MaterialBindGroupAllocator::NonBindless(_) => {
-                // TODO: Have a fast path for non-bindless materials.
-                false
+            MaterialBindGroupAllocator::NonBindless(ref mut allocator) => {
+                allocator.try_update_data(existing_binding_id, unprepared_bind_group, layout)
             }
         }
     }
@@ -724,15 +726,14 @@ impl MaterialBindGroupAllocator {
     /// Uploads the contents of all buffers that this
     /// [`MaterialBindGroupAllocator`] manages to the GPU.
     ///
-    /// Non-bindless allocators don't currently manage any buffers, so this
-    /// method only has an effect for bindless allocators.
+
     pub fn write_buffers(&mut self, render_device: &RenderDevice, render_queue: &RenderQueue) {
         match *self {
             MaterialBindGroupAllocator::Bindless(
                 ref mut material_bind_group_bindless_allocator,
             ) => material_bind_group_bindless_allocator.write_buffers(render_device, render_queue),
-            MaterialBindGroupAllocator::NonBindless(_) => {
-                // Not applicable.
+            MaterialBindGroupAllocator::NonBindless(ref mut allocator) => {
+                allocator.write_buffers(render_queue);
             }
         }
     }
@@ -2364,6 +2365,37 @@ fn init_fallback_resources(mut commands: Commands, render_device: Res<RenderDevi
     )));
 }
 
+// Validate every binding before changing any retained bytes: a failed update must
+// leave the old material intact until its replacement has been prepared.
+fn update_non_bindless_data(
+    bindings: &mut crate::render_resource::BindingResources,
+    builder: &BindGroupBuilder,
+) -> bool {
+    if bindings.len() != builder.binding_resources.len() || !bindings.iter()
+        .zip(builder.binding_resources.iter())
+        .all(|((old_index, old), (new_index, new))| {
+            old_index == new_index && match (old, new) {
+                (OwnedBindingResource::Data(data), UnpreparedBindingResource::Data(range)) => {
+                    data.len() == range.len() && builder.data_buffer.get(range.start as usize..range.end as usize).is_some()
+                }
+                (OwnedBindingResource::Buffer(a), UnpreparedBindingResource::Buffer(b)) => a.id() == b.id(),
+                (OwnedBindingResource::ShaderBuffer(a), UnpreparedBindingResource::ShaderBuffer(b)) => a.id() == b.id(),
+                (OwnedBindingResource::TextureView(ad, a), UnpreparedBindingResource::TextureView(bd, b)) => ad == bd && a.id() == b.id(),
+                (OwnedBindingResource::Sampler(at, a), UnpreparedBindingResource::Sampler(bt, b)) => at == bt && a.id() == b.id(),
+                _ => false,
+            }
+        })
+    {
+        return false;
+    }
+    for ((_, old), (_, new)) in bindings.iter_mut().zip(builder.binding_resources.iter()) {
+        if let (OwnedBindingResource::Data(data), UnpreparedBindingResource::Data(range)) = (old, new) {
+            data.0.copy_from_slice(&builder.data_buffer[range.start as usize..range.end as usize]);
+        }
+    }
+    true
+}
+
 impl MaterialBindGroupNonBindlessAllocator {
     /// Creates a new [`MaterialBindGroupNonBindlessAllocator`] managing the
     /// bind groups for a single non-bindless material.
@@ -2373,6 +2405,46 @@ impl MaterialBindGroupNonBindlessAllocator {
             bind_groups: vec![],
             to_prepare: HashSet::default(),
             free_indices: vec![],
+            dirty_uniforms: HashSet::default(),
+        }
+    }
+
+    fn try_update_data(
+        &mut self,
+        binding: MaterialBindingId,
+        builder: &BindGroupBuilder,
+        new_layout: &BindGroupLayoutDescriptor,
+    ) -> bool {
+        let Some(Some(MaterialNonBindlessAllocatedBindGroup::Prepared {
+            bind_group, layout, uniform_buffers,
+        })) = self.bind_groups.get_mut(*binding.group as usize) else {
+            return false;
+        };
+        // Directly prepared groups don't necessarily own writable uniform buffers.
+        if layout != new_layout || uniform_buffers.len() != bind_group.bindings.iter()
+            .filter(|(_, resource)| matches!(resource, OwnedBindingResource::Data(_))).count()
+            || !update_non_bindless_data(&mut bind_group.bindings, builder)
+        {
+            return false;
+        }
+        self.dirty_uniforms.insert(binding.group);
+        true
+    }
+
+    fn write_buffers(&mut self, queue: &RenderQueue) {
+        for group in self.dirty_uniforms.drain() {
+            let Some(MaterialNonBindlessAllocatedBindGroup::Prepared {
+                bind_group, uniform_buffers, ..
+            }) = &self.bind_groups[*group as usize] else {
+                // Invalidation may already have rebuilt this group with current data.
+                continue;
+            };
+            let mut buffers = uniform_buffers.iter();
+            for (_, resource) in bind_group.bindings.iter() {
+                if let OwnedBindingResource::Data(data) = resource {
+                    queue.write_buffer(buffers.next().unwrap(), 0, &data.0);
+                }
+            }
         }
     }
 
@@ -2446,6 +2518,7 @@ impl MaterialBindGroupNonBindlessAllocator {
         debug_assert!(self.bind_groups[*binding_id.group as usize].is_some());
         self.bind_groups[*binding_id.group as usize] = None;
         self.to_prepare.remove(&binding_id.group);
+        self.dirty_uniforms.remove(&binding_id.group);
         self.free_indices.push(binding_id.group);
     }
 
@@ -2796,7 +2869,7 @@ impl RenderMaterialBindings {
                         // the bind group allocator.
                         let old_binding = *occupied_entry.get();
                         if bind_group_allocator
-                            .try_update_data(old_binding, &mut self.bind_group_builder)
+                            .try_update_data(old_binding, &mut self.bind_group_builder, material_layout)
                         {
                             Ok(old_binding)
                         } else {
@@ -2871,6 +2944,116 @@ impl RenderMaterialBindings {
 mod tests {
     use super::*;
     use crate::render_resource::{BindingNumber, BindlessIndexTableDescriptor};
+
+    #[test]
+    fn non_bindless_allocator_reuses_gpu_resources_and_invalidates_layout() {
+        use crate::render_resource::{BindingResources, OwnedData};
+        let (device, queue) = wgpu::Device::noop(&Default::default());
+        let device = RenderDevice::new(device);
+        let queue = RenderQueue::new(queue);
+        let layout = BindGroupLayoutDescriptor {
+            label: "reuse test".into(),
+            entries: vec![wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        };
+        let actual_layout = device.create_bind_group_layout("reuse test", &layout.entries);
+        let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
+            label: None,
+            contents: &[1; 16],
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+        let group = device.create_bind_group("reuse test", &actual_layout, &[
+            BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },
+        ]);
+        let group_id = group.id();
+        let buffer_id = buffer.id();
+        let mut allocator = MaterialBindGroupNonBindlessAllocator::new("reuse test");
+        let binding = allocator.allocate(MaterialNonBindlessAllocatedBindGroup::Prepared {
+            bind_group: PreparedBindGroup {
+                bind_group: group,
+                bindings: BindingResources(vec![(0, OwnedBindingResource::Data(OwnedData(vec![1; 16])))]),
+            },
+            layout: layout.clone(),
+            uniform_buffers: vec![buffer],
+        });
+        let builder = BindGroupBuilder {
+            binding_resources: UnpreparedBindingResources(vec![(0, UnpreparedBindingResource::Data(0..16))]),
+            data_buffer: vec![2; 16],
+        };
+        assert!(allocator.try_update_data(binding, &builder, &layout));
+        allocator.write_buffers(&queue);
+        assert!(allocator.dirty_uniforms.is_empty());
+        let Some(MaterialNonBindlessAllocatedBindGroup::Prepared { bind_group, uniform_buffers, .. }) = &allocator.bind_groups[0] else { unreachable!() };
+        assert_eq!(bind_group.bind_group.id(), group_id);
+        assert_eq!(uniform_buffers[0].id(), buffer_id);
+        let mut changed_layout = layout.clone();
+        changed_layout.entries[0].visibility = wgpu::ShaderStages::VERTEX;
+        assert!(!allocator.try_update_data(binding, &builder, &changed_layout));
+        assert!(allocator.try_update_data(binding, &builder, &layout));
+        allocator.free(binding);
+        assert!(allocator.dirty_uniforms.is_empty());
+        assert!(!allocator.try_update_data(binding, &builder, &layout));
+    }
+
+    #[test]
+    fn non_bindless_uniform_updates_preserve_independent_material_data() {
+        use crate::render_resource::{BindingResources, OwnedData};
+        let mut materials: Vec<_> = (0..1000u32).map(|id| BindingResources(vec![
+            (0, OwnedBindingResource::Data(OwnedData(id.to_le_bytes().to_vec()))),
+        ])).collect();
+        for step in 1..4u32 {
+            for (id, bindings) in materials.iter_mut().enumerate() {
+                let bytes = ((id as u32) + step * 1000).to_le_bytes();
+                let allocation = match &bindings[0].1 {
+                    OwnedBindingResource::Data(data) => data.as_ptr(),
+                    _ => unreachable!(),
+                };
+                let builder = BindGroupBuilder {
+                    binding_resources: UnpreparedBindingResources(vec![(0, UnpreparedBindingResource::Data(0..4))]),
+                    data_buffer: bytes.to_vec(),
+                };
+                assert!(update_non_bindless_data(bindings, &builder));
+                let OwnedBindingResource::Data(data) = &bindings[0].1 else { unreachable!() };
+                assert_eq!(data.as_ptr(), allocation);
+                assert_eq!(data.0, bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn non_bindless_uniform_updates_reject_binding_changes_atomically() {
+        use crate::render_resource::{BindingResources, OwnedData};
+        let mut bindings = BindingResources(vec![
+            (0, OwnedBindingResource::Data(OwnedData(vec![1; 4]))),
+            (1, OwnedBindingResource::ShaderBuffer(Handle::default())),
+        ]);
+        let mut builder = BindGroupBuilder {
+            binding_resources: UnpreparedBindingResources(vec![
+                (0, UnpreparedBindingResource::Data(0..4)),
+                (1, UnpreparedBindingResource::Data(4..8)),
+            ]),
+            data_buffer: vec![2; 8],
+        };
+        assert!(!update_non_bindless_data(&mut bindings, &builder));
+        let OwnedBindingResource::Data(data) = &bindings[0].1 else { unreachable!() };
+        assert_eq!(data.0, vec![1; 4]);
+        builder.binding_resources[1].1 = UnpreparedBindingResource::ShaderBuffer(Handle::default());
+        assert!(update_non_bindless_data(&mut bindings, &builder));
+        builder.binding_resources[0].0 = 2;
+        assert!(!update_non_bindless_data(&mut bindings, &builder));
+        builder.binding_resources[0] = (0, UnpreparedBindingResource::Data(0..8));
+        assert!(!update_non_bindless_data(&mut bindings, &builder));
+        builder.binding_resources.pop();
+        assert!(!update_non_bindless_data(&mut bindings, &builder));
+    }
 
     #[test]
     fn get_bindless_index_table() {

@@ -40,6 +40,18 @@ test('raw Wasm indexes use exact supplied names; an inner operation is not charg
   expect(conversionContributors(profile, result, names).every(row => !row.symbol.includes('map_wgt_features'))).toBe(true);
 });
 
+test('creation contributors use exclusive OS weights and retain material callers', () => {
+  const profile = fixture();
+  profile.threads[0].stringTable[0] = 'bevy_render::material_bind_groups::MaterialBindGroupAllocator::prepare_bind_groups';
+  profile.threads[0].stringTable[1] = 'wgpu::Device::create_bind_group';
+  const rows = conversionContributors(profile, result, new Map(), 'resource_creation');
+  expect(rows).toHaveLength(1);
+  expect(rows[0].samples).toBe(2);
+  expect(rows[0].cpu_ms_per_update).toBe(5);
+  expect(rows[0].symbol).toBe('wgpu::Device::create_bind_group');
+  expect(rows[0].stack.at(-1).symbol).toContain('prepare_bind_groups');
+});
+
 test('unavailable accounting is rejected rather than reporting zero conversion CPU', () => {
   expect(() => conversionContributors({}, result, new Map())).toThrow('CPU window');
 });
