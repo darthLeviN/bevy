@@ -271,8 +271,14 @@ impl SystemExecutor for MultiThreadedExecutor {
 
         let environment = &Environment::new(self, schedule, world);
 
+        // A browser main thread cannot park while waiting for workers. Let it
+        // execute eligible Send tasks instead of only polling their completion.
+        #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+        let help_workers = !bevy_tasks::is_web_worker_thread();
+        #[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
+        let help_workers = false;
         ComputeTaskPool::get_or_init(TaskPool::default).scope_with_executor(
-            false,
+            help_workers,
             thread_executor,
             |scope| {
                 let context = Context {

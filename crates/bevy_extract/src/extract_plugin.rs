@@ -138,6 +138,9 @@ pub fn extract(main_world: &mut World, sub_world: &mut World) {
     let scratch_world = main_world.remove_resource::<ScratchMainWorld>().unwrap();
     let inserted_world = core::mem::replace(main_world, scratch_world.0);
     sub_world.insert_resource(MainWorld(inserted_world));
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    bevy_ecs::schedule::with_local_task_scopes(|| sub_world.run_schedule(ExtractSchedule));
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
     sub_world.run_schedule(ExtractSchedule);
 
     // move the app world back, as if nothing happened.

@@ -146,6 +146,7 @@ multi_threaded = [
   "bevy_tasks/multi_threaded",
   "bevy_transform/multi_threaded",
 ]
+wasm_threads = ["std", "bevy_ecs/wasm_threads", "bevy_tasks/wasm_threads"]
 async-io = ["std", "bevy_tasks/async-io"]
 
 # Display server protocol support (X11 is enabled by default)

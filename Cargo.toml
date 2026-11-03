@@ -556,6 +556,9 @@ serialize = ["bevy_internal/serialize"]
 # Enables multithreaded parallelism in the engine. Disabling it forces all engine tasks to run on a single thread.
 multi_threaded = ["bevy_internal/multi_threaded"]
 
+# Experimental browser workers. Await tasks::init_web_thread_pools before App startup.
+wasm_threads = ["bevy_internal/wasm_threads"]
+
 # Use async-io's implementation of block_on instead of futures-lite's implementation. This is preferred if your application uses async-io.
 async-io = ["bevy_internal/async-io"]
 

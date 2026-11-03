@@ -7,6 +7,8 @@ use bevy_utils::prelude::DebugName;
 use core::any::TypeId;
 
 pub use self::single_threaded::SingleThreadedExecutor;
+#[cfg(feature = "std")]
+pub use bevy_tasks::with_local_task_scopes;
 
 #[cfg(feature = "std")]
 pub use self::multi_threaded::{MainThreadExecutor, MultiThreadedExecutor};
@@ -43,11 +45,11 @@ pub trait SystemExecutor: Send + Sync {
 
 /// Returns the default executor for the current platform.
 ///
-/// On Wasm or when the `multi_threaded` feature is disabled, this returns a
+/// On Wasm without `wasm_threads`, or when `multi_threaded` is disabled, this returns a
 /// [`SingleThreadedExecutor`]. Otherwise it returns a [`MultiThreadedExecutor`].
 pub fn default_executor() -> Box<dyn SystemExecutor> {
     #[cfg(all(
-        not(target_arch = "wasm32"),
+        any(not(target_arch = "wasm32"), feature = "wasm_threads"),
         feature = "std",
         feature = "multi_threaded"
     ))]
@@ -55,7 +57,7 @@ pub fn default_executor() -> Box<dyn SystemExecutor> {
         Box::new(MultiThreadedExecutor::new())
     }
     #[cfg(any(
-        target_arch = "wasm32",
+        all(target_arch = "wasm32", not(feature = "wasm_threads")),
         not(feature = "std"),
         not(feature = "multi_threaded")
     ))]

@@ -434,6 +434,8 @@ pub fn no_automatic_morph_batching(
     mut commands: Commands,
     query: Query<Entity, (With<MeshMorphWeights>, Without<NoAutomaticBatching>)>,
     render_device: Res<RenderDevice>,
+    // Device-limit queries still touch a browser-thread-affine GPU handle.
+    #[cfg(target_arch = "wasm32")] _gpu_thread: bevy_ecs::system::NonSendMarker,
 ) {
     // We *can* batch mesh instances with morph targets if the platform supports
     // storage buffers.

@@ -512,6 +512,13 @@ fn renderer_is_ready(state: Res<RenderState>) -> bool {
 }
 
 fn run_render_schedule(world: &mut World) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    bevy_tasks::with_local_task_scopes(|| run_render_schedule_inner(world));
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+    run_render_schedule_inner(world);
+}
+
+fn run_render_schedule_inner(world: &mut World) {
     world.resource_scope(|world, order: Mut<RenderScheduleOrder>| {
         for &label in &order.labels {
             let _ = world.try_run_schedule(label);

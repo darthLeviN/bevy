@@ -1,9 +1,10 @@
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{future::Future, marker::PhantomData, mem, panic::AssertUnwindSafe};
-use std::{
-    thread::{self, JoinHandle},
-    thread_local,
-};
+use std::thread_local;
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
+use std::thread::{self, JoinHandle};
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+use wasm_thread::{self as thread, JoinHandle};
 
 use crate::executor::FallibleTask;
 use bevy_platform::sync::Arc;
@@ -139,6 +140,8 @@ pub struct TaskPool {
     // The inner state of the pool.
     threads: Vec<JoinHandle<()>>,
     shutdown_tx: async_channel::Sender<()>,
+    #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+    worker_ready: async_channel::Receiver<()>,
 }
 
 impl TaskPool {
@@ -159,6 +162,8 @@ impl TaskPool {
 
     fn new_internal(builder: TaskPoolBuilder) -> Self {
         let (shutdown_tx, shutdown_rx) = async_channel::unbounded::<()>();
+        #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+        let (ready_tx, worker_ready) = async_channel::unbounded::<()>();
 
         let executor = Arc::new(crate::executor::Executor::new());
 
@@ -177,6 +182,8 @@ impl TaskPool {
             .map(|i| {
                 let ex = Arc::clone(&executor);
                 let shutdown_rx = shutdown_rx.clone();
+                #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+                let ready_tx = ready_tx.clone();
 
                 let thread_name = if let Some(thread_name) = builder.thread_name.as_deref() {
                     format!("{thread_name} ({i})")
@@ -200,6 +207,9 @@ impl TaskPool {
                                 drop(on_thread_spawn);
                             }
                             let _destructor = CallOnDrop(on_thread_destroy);
+                            // Closing the last startup sender wakes every readiness waiter.
+                            #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+                            drop(ready_tx);
                             loop {
                                 let res = std::panic::catch_unwind(|| {
                                     let tick_forever = async move {
@@ -221,16 +231,38 @@ impl TaskPool {
             })
             .collect();
 
+        #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+        drop(ready_tx);
         Self {
             executor,
             threads,
             shutdown_tx,
+            #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+            worker_ready,
         }
+    }
+
+    /// Waits asynchronously until every Web Worker has entered the task executor.
+    ///
+    /// On the browser main thread, await this before running synchronous scopes or
+    /// ECS schedules. Worker creation needs the browser event loop to make progress.
+    /// This method is repeatable and supports concurrent readiness waiters.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+    pub async fn ready(&self) {
+        while self.worker_ready.recv().await.is_ok() {}
     }
 
     /// Return the number of threads owned by the task pool
     pub fn thread_num(&self) -> usize {
         self.threads.len()
+    }
+
+    /// Effective query parallelism for the current scope's affinity policy.
+    ///
+    /// A GPU-affine local scope has one execution thread, even when this pool
+    /// owns multiple workers. Query iterators can then skip task batching entirely.
+    pub fn scope_thread_num(&self) -> usize {
+        if crate::scope_dispatch::workers_enabled() { self.thread_num() } else { 1 }
     }
 
     /// Allows spawning non-`'static` futures on the thread pool. The function takes a callback,
@@ -376,6 +408,9 @@ impl TaskPool {
         F: for<'scope> FnOnce(&'scope Scope<'scope, 'env, T>),
         T: Send + 'static,
     {
+        #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+        assert!(crate::is_web_worker_thread() || self.worker_ready.is_closed(),
+            "await TaskPool::ready() before running scopes on the browser main thread");
         // SAFETY: This safety comment applies to all references transmuted to 'env.
         // Any futures spawned with these references need to return before this function completes.
         // This is guaranteed because we drive all the futures spawned onto the Scope
@@ -383,7 +418,11 @@ impl TaskPool {
         // transmute the lifetimes to 'env here to appease the compiler as it is unable to validate safety.
         // Any usages of the references passed into `Scope` must be accessed through
         // the transmuted reference for the rest of this function.
-        let executor: &crate::executor::Executor = &self.executor;
+        let workers_enabled = crate::scope_dispatch::workers_enabled();
+        // A private executor cannot be ticked by pool workers. This is necessary
+        // for nested par_iter/scopes inside browser-thread-affine rendering work.
+        let local_executor = (!workers_enabled).then(crate::executor::Executor::new);
+        let executor: &crate::executor::Executor = local_executor.as_ref().unwrap_or(&self.executor);
         // SAFETY: As above, all futures must complete in this function so we can change the lifetime
         let executor: &'env crate::executor::Executor = unsafe { mem::transmute(executor) };
         // SAFETY: As above, all futures must complete in this function so we can change the lifetime
@@ -433,7 +472,7 @@ impl TaskPool {
                     results
                 };
 
-                let tick_task_pool_executor = tick_task_pool_executor || self.threads.is_empty();
+                let tick_task_pool_executor = tick_task_pool_executor || self.threads.is_empty() || !workers_enabled;
 
                 // we get this from a thread local so we should always be on the scope executors thread.
                 // note: it is possible `scope_executor` and `external_executor` is the same executor,
@@ -563,11 +602,21 @@ impl TaskPool {
     ///
     /// If the provided future is non-`Send`, [`TaskPool::spawn_local`] should
     /// be used instead.
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
     pub fn spawn<T>(&self, future: impl Future<Output = T> + Send + 'static) -> Task<T>
     where
         T: Send + 'static,
     {
         self.executor.spawn(future)
+    }
+
+    /// Spawns a browser future on its originating thread without imposing Send.
+    ///
+    /// Browser asset/I/O futures may contain JS values and require microtasks.
+    /// Parallel ECS work instead uses `Scope::spawn`, which still requires Send.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+    pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Task<T> {
+        self.spawn_local(future)
     }
 
     /// Spawns a static future on the thread-local async executor for the
@@ -585,6 +634,10 @@ impl TaskPool {
     where
         T: 'static,
     {
+        #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+        if !crate::is_web_worker_thread() {
+            return web_task::spawn_local(future);
+        }
         TaskPool::LOCAL_EXECUTOR.with(|executor| executor.spawn(future))
     }
 
@@ -616,8 +669,15 @@ impl Default for TaskPool {
 impl Drop for TaskPool {
     fn drop(&mut self) {
         self.shutdown_tx.close();
+        #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+        if !crate::is_web_worker_thread() {
+            // Joining would block the browser event loop. Workers retain their
+            // owned executor state and exit after observing the shutdown channel.
+            self.threads.clear();
+            return;
+        }
 
-        let panicking = thread::panicking();
+        let panicking = std::thread::panicking();
         for join_handle in self.threads.drain(..) {
             let res = join_handle.join();
             if !panicking {
@@ -712,6 +772,30 @@ mod tests {
     use super::*;
     use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::Barrier;
+
+    #[test]
+    fn browser_affinity_boundary_keeps_nested_scopes_local_and_restores_workers() {
+        let pool = TaskPoolBuilder::new().num_threads(2).build();
+        let owner = thread::current().id();
+        let outputs = crate::with_local_task_scopes(|| pool.scope_with_executor(false, None, |scope| {
+            for _ in 0..8 {
+                let pool = &pool;
+                scope.spawn(async move {
+                    assert_eq!(thread::current().id(), owner);
+                    pool.scope_with_executor(false, None, |nested| {
+                        nested.spawn(async move { thread::current().id() == owner });
+                    })[0]
+                });
+            }
+        }));
+        assert_eq!(outputs, vec![true; 8]);
+        let normal = pool.scope_with_executor(false, None, |scope| {
+            for _ in 0..8 {
+                scope.spawn(async move { thread::current().id() != owner });
+            }
+        });
+        assert_eq!(normal, vec![true; 8]);
+    }
 
     #[test]
     fn test_spawn() {

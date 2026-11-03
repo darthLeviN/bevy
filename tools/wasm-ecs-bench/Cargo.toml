@@ -1,0 +1,29 @@
+[package]
+name = "wasm-ecs-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bevy_ecs = { path = "../../crates/bevy_ecs", default-features = false, features = ["std", "wasm_threads"] }
+bevy_tasks = { path = "../../crates/bevy_tasks", features = ["wasm_threads"] }
+wasm_thread = "=0.3.3"
+wasm-bindgen = "=0.2.121"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Document", "WorkerGlobalScope", "Performance"] }
+serde_json = "1"
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = 2
+codegen-units = 16
+lto = false
+debug = 0
+strip = "debuginfo"
+panic = "abort"

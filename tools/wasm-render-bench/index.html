@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Bevy O3 rendering benchmark</title></head>
+<body>
+<canvas id="scene" width="1280" height="720"></canvas>
+<pre id="result"></pre>
+<script>
+  window.benchmarkConsole = [];
+  window.benchmarkFail = error => {
+    window.benchmarkFatal = String(error?.stack ?? error);
+    const result = document.querySelector('#result');
+    result.dataset.failed = 'true';
+  };
+  for (const level of ['warn', 'error']) {
+    const original = console[level].bind(console);
+    console[level] = (...args) => {
+      window.benchmarkConsole.push({ level, message: args.map(String).join(' ') });
+      original(...args);
+    };
+  }
+  window.addEventListener('error', event => window.benchmarkFail(event.error ?? event.message));
+  window.addEventListener('unhandledrejection', event => window.benchmarkFail(event.reason));
+  const workers = new BroadcastChannel('bevy-render-benchmark');
+  workers.onmessage = event => { if (event.data?.fatal) window.benchmarkFail(event.data.fatal); };
+</script>
+<script type="module">
+  try {
+    const { default: init, start } = await import('./pkg/wasm_render_bench.js');
+    await init();
+    const mode = new URL(location.href).searchParams.get('mode');
+    if (!['serial', 'threaded'].includes(mode)) throw Error('Expected serial or threaded mode');
+    await start(mode === 'threaded', new URL('./pkg/wasm_render_bench.js', location.href).href,
+      new URL('./pool-worker.mjs', location.href).href);
+  } catch (error) { window.benchmarkFail(error); }
+</script>
+</body>
+</html>

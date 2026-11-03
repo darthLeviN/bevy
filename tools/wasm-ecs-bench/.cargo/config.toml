@@ -1,0 +1,24 @@
+# This configuration applies only when invoked from this standalone experiment.
+[build]
+jobs = 2
+target = "wasm32-unknown-unknown"
+target-dir = "../../../../.cache/bevy-web-ecs/target"
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+  "-C", "link-arg=--shared-memory",
+  "-C", "link-arg=--import-memory",
+  "-C", "link-arg=--max-memory=1073741824",
+
+  "-C", "link-arg=--export=__wasm_init_tls",
+  "-C", "link-arg=--export=__tls_size",
+  "-C", "link-arg=--export=__tls_align",
+  "-C", "link-arg=--export=__tls_base",
+]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[resolver]
+incompatible-publish-age = "allow"

@@ -19,6 +19,9 @@ default = ["std", "bevy_reflect", "async_executor", "backtrace"]
 ## multiple threads whenever possible.
 multi_threaded = ["bevy_tasks/multi_threaded"]
 
+## Experimental shared-memory Web Workers; asynchronously initialize pools before page schedules.
+wasm_threads = ["std", "multi_threaded", "bevy_tasks/wasm_threads"]
+
 ## Adds serialization support through `serde`.
 serialize = ["dep:serde", "bevy_platform/serialize", "indexmap/serde"]
 

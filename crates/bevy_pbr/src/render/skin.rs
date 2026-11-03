@@ -503,6 +503,8 @@ pub fn no_automatic_skin_batching(
     mut commands: Commands,
     query: Query<Entity, (With<SkinnedMesh>, Without<NoAutomaticBatching>)>,
     render_device: Res<RenderDevice>,
+    // Device-limit queries still touch a browser-thread-affine GPU handle.
+    #[cfg(target_arch = "wasm32")] _gpu_thread: bevy_ecs::system::NonSendMarker,
 ) {
     if !skins_use_uniform_buffers(&render_device.limits()) {
         return;

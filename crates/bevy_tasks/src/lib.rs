@@ -18,7 +18,7 @@ pub mod cfg {
             async_executor
         }
 
-        #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))] => {
+        #[cfg(all(any(not(target_arch = "wasm32"), feature = "wasm_threads"), feature = "multi_threaded"))] => {
             /// Indicates multithreading support.
             multi_threaded
         }
@@ -33,9 +33,30 @@ pub mod cfg {
 
 cfg::std! {
     extern crate std;
+    mod scope_dispatch;
+    pub use scope_dispatch::with_local_task_scopes;
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+mod worker_failure;
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+mod thread_context;
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+pub use thread_context::is_web_worker_thread;
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+static WORKER_FAILURE: worker_failure::WorkerFailure = worker_failure::WorkerFailure::new();
+
+/// Records a worker trap using shared memory, even if the page's JS queue is blocked.
+/// Worker entry-point error handlers must call this before posting JS diagnostics.
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+pub fn report_web_worker_failure(message: &str) {
+    WORKER_FAILURE.report(message);
 }
 
 extern crate alloc;
+
+#[cfg(all(feature = "wasm_threads", target_arch = "wasm32", not(target_feature = "atomics")))]
+compile_error!("wasm_threads requires an atomics-enabled Wasm build and rebuilt standard library");
 
 cfg::conditional_send! {
     if {
@@ -104,7 +125,50 @@ cfg::multi_threaded! {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
 pub use bevy_platform::future::block_on;
+
+/// Completes a synchronous CPU task scope without parking the browser main thread.
+///
+/// Workers use the normal parking implementation. The browser main thread must
+/// poll instead: `memory.atomic.wait32` is forbidden there. This cannot drive
+/// browser I/O or worker startup; await those asynchronously before entering a scope.
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+pub fn block_on<T>(future: impl Future<Output = T>) -> T {
+    if is_web_worker_thread() {
+        return bevy_platform::future::block_on(future);
+    }
+    let mut future = core::pin::pin!(future);
+    let mut context = core::task::Context::from_waker(core::task::Waker::noop());
+    loop {
+        if let Some(message) = WORKER_FAILURE.message() {
+            panic!("Web Worker failed while the page awaited an ECS task: {message}");
+        }
+        match future.as_mut().poll(&mut context) {
+            core::task::Poll::Ready(value) => return value,
+            core::task::Poll::Pending => core::hint::spin_loop(),
+        }
+    }
+}
+
+/// Creates and asynchronously starts shared-memory task pools for a regular web page.
+///
+/// Await this after wasm-bindgen initialization and before constructing/running
+/// the Bevy app. Existing pools are retained. Schedules and non-Send systems stay
+/// on their calling thread; eligible Send systems and parallel queries use workers.
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+pub async fn init_web_thread_pools(compute_threads: usize) {
+    assert!(compute_threads > 0);
+    let compute = ComputeTaskPool::get_or_init(|| TaskPoolBuilder::new()
+        .num_threads(compute_threads).thread_name("Compute Task Pool".into()).build());
+    let io = IoTaskPool::get_or_init(|| TaskPoolBuilder::new()
+        .num_threads(1).thread_name("IO Task Pool".into()).build());
+    let asynchronous = AsyncComputeTaskPool::get_or_init(|| TaskPoolBuilder::new()
+        .num_threads(1).thread_name("Async Compute Task Pool".into()).build());
+    compute.ready().await;
+    io.ready().await;
+    asynchronous.ready().await;
+}
 
 /// The tasks prelude.
 ///
