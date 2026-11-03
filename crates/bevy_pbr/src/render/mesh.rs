@@ -2517,6 +2517,7 @@ pub fn set_mesh_motion_vector_flags(
     }
 }
 
+#[cfg(test)]
 fn queue_mesh_input_batch(
     entries: &mut Vec<(u32, MeshInputUniform)>,
     index: u32,
@@ -2532,6 +2533,7 @@ fn queue_mesh_input_batch(
 
 // Flush only distinct indices: repeated indices start a new batch so history
 // always observes the preceding write, including within the same task.
+#[cfg(test)]
 fn flush_mesh_input_batch(
     entries: &mut Vec<(u32, MeshInputUniform)>,
     current: &InstanceInputUniformBuffer<MeshInputUniform>,
@@ -2549,6 +2551,31 @@ fn flush_mesh_input_batch(
         uniform.previous_input_index = first + offset as u32;
     }
     current.set_batch(entries);
+    entries.clear();
+}
+
+fn flush_exclusive_mesh_input_batch(
+    entries: &mut Vec<(u32, MeshInputUniform)>,
+    current: &bevy_render::render_resource::ExclusivePayload<'_, MeshInputUniform>,
+    previous: &bevy_render::render_resource::ExclusivePayload<'_, PreviousMeshInputUniform>,
+    cursor: &core::sync::atomic::AtomicU32,
+    dirty: &[core::sync::atomic::AtomicU64],
+    summary: &[core::sync::atomic::AtomicU64],
+) {
+    if entries.is_empty() { return; }
+    assert!(entries.len() <= 128);
+    // Claim every destination before reading any payload, across all workers.
+    let mut records: [_; 128] = core::array::from_fn(|i| entries.get(i).map(|entry| current.claim(entry.0)));
+    let mut history = [PreviousMeshInputUniform::default(); 128];
+    for (record, old) in records.iter().zip(history.iter_mut()).take(entries.len()) {
+        old.world_from_local = record.as_ref().unwrap().read().world_from_local;
+    }
+    let first = previous.append(cursor, &history[..entries.len()]);
+    for (offset, ((_, uniform), record)) in entries.iter_mut().zip(records.iter_mut()).enumerate() {
+        uniform.previous_input_index = first + offset as u32;
+        record.as_mut().unwrap().write(*uniform);
+    }
+    bevy_render::render_resource::mark_exclusive_payload_batch(entries.iter().map(|entry| entry.0), summary, dirty);
     entries.clear();
 }
 
@@ -2613,8 +2640,10 @@ pub fn collect_meshes_for_gpu_building(
         let skin_uniforms = &skin_uniforms;
         let frame_count = *frame_count;
         let render_mesh_instances = &*render_mesh_instances;
-        let current_input_buffer = &*current_input_buffer;
-        let previous_input_buffer = &*previous_input_buffer;
+        let (current_payload, dirty, summary) = current_input_buffer.exclusive_payload();
+        let (history_payload, history_cursor) = previous_input_buffer.exclusive_payload();
+        let current_payload = &current_payload;
+        let history_payload = &history_payload;
         let mesh_culling_data_buffer = &*mesh_culling_data_buffer;
         let morph_indices = &*morph_indices;
 
@@ -2746,19 +2775,17 @@ pub fn collect_meshes_for_gpu_building(
                                 let current_uniform_index =
                                     render_mesh_instance.gpu_specific.current_uniform_index();
 
-                                // Normally extraction owns one entry per entity. Preserve
-                                // scalar history semantics even for duplicate queued indices.
-                                queue_mesh_input_batch(
-                                    &mut input_batch, current_uniform_index,
-                                    prepared.mesh_input_uniform, current_input_buffer, previous_input_buffer,
-                                );
+                                if input_batch.len() == 128 {
+                                    flush_exclusive_mesh_input_batch(&mut input_batch, current_payload, history_payload, history_cursor, dirty, summary);
+                                }
+                                input_batch.push((current_uniform_index, prepared.mesh_input_uniform));
                                 // Bounds are model-space: moving the instance doesn't
                                 // require another culling-buffer upload.
                                 mesh_culling_data_buffer
                                     .set_if_changed_bytes(current_uniform_index, mesh_culling_builder);
                             }
                             // Scope joins before slow-path updates, removals, reuse or uploads.
-                            flush_mesh_input_batch(&mut input_batch, current_input_buffer, previous_input_buffer);
+                            flush_exclusive_mesh_input_batch(&mut input_batch, current_payload, history_payload, history_cursor, dirty, summary);
 
                             for entity in removed.drain(..) {
                                 removed_tx.send(entity).unwrap();

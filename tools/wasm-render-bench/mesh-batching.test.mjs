@@ -40,7 +40,7 @@ impl<BPDI:AtomicPod> PreviousInstanceInputUniformBuffer<BPDI> { ${method(gpu,'pu
 struct InstanceInputUniformBuffer<T:AtomicPod> { buffer:AtomicSparseBufferVec<T>, marker:PhantomData<T> }
 impl<BDI:AtomicPod> InstanceInputUniformBuffer<BDI> { ${method(gpu,'set_batch')} }
 impl InstanceInputUniformBuffer<MeshInputUniform> { fn get_unchecked(&self,i:u32)->MeshInputUniform { let v=&self.buffer.values[i as usize]; MeshInputUniform { world_from_local:v[0].load(Ordering::Relaxed),previous_input_index:v[1].load(Ordering::Relaxed),flags:v[2].load(Ordering::Relaxed) } } }
-${mesh.slice(mesh.indexOf('fn queue_mesh_input_batch('),mesh.indexOf('/// Creates the [\u0060RenderMeshInstanceGpu\u0060]s',mesh.indexOf('fn queue_mesh_input_batch(')))}
+${mesh.slice(mesh.indexOf('fn queue_mesh_input_batch('),mesh.indexOf('fn flush_exclusive_mesh_input_batch(',mesh.indexOf('fn queue_mesh_input_batch(')))}
 fn current(n:usize)->InstanceInputUniformBuffer<MeshInputUniform> { InstanceInputUniformBuffer { buffer:AtomicSparseBufferVec { values:(0..n).map(|i|[AtomicU32::new(i as u32),AtomicU32::new(u32::MAX),AtomicU32::new(0)]).collect(),dirty_bits:(0..n.div_ceil(64)).map(|_|AtomicU64::new(0)).collect(),summary:(0..n.div_ceil(4096)).map(|_|AtomicU64::new(0)).collect() },marker:PhantomData } }
 fn history(n:usize)->PreviousInstanceInputUniformBuffer<PreviousMeshInputUniform> { PreviousInstanceInputUniformBuffer { buffer:Raw { values:(0..n).map(|_|AtomicU32::new(0)).collect(),writes:AtomicU32::new(0) },atomic_len:Cursor::new() } }
 #[test] fn mixed_sparse_duplicates_drains_reuse_and_history() {
