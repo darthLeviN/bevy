@@ -484,6 +484,23 @@ impl TaskPool {
                     None
                 };
 
+                #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+                if !crate::is_web_worker_thread() {
+                    return crate::polling_scope::execute(get_results, || {
+                        // Match the existing executor-loop panic boundary: scoped
+                        // task panics are collected by get_results, not swallowed.
+                        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            scope_ticker.try_tick();
+                            if let Some(ticker) = &external_ticker {
+                                ticker.try_tick();
+                            }
+                            if tick_task_pool_executor {
+                                executor.try_tick();
+                            }
+                        }));
+                    }).await;
+                }
+
                 match (external_ticker, tick_task_pool_executor) {
                     (Some(external_ticker), true) => {
                         Self::execute_global_external_scope(

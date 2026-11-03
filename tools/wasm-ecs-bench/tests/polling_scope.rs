@@ -1,0 +1,97 @@
+#[path = "../../../crates/bevy_tasks/src/polling_scope.rs"]
+mod polling_scope;
+
+use std::{
+    future::Future,
+    pin::pin,
+    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    task::{Context, Poll, Wake, Waker},
+};
+use bevy_tasks::{ThreadExecutor, futures_lite::FutureExt};
+
+#[derive(Default)]
+struct Wakes(AtomicUsize);
+impl Wake for Wakes {
+    fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+    fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+}
+
+#[test]
+fn empty_polling_executor_does_not_register_a_redundant_sleeper() {
+    let executor = ThreadExecutor::new();
+    let ticker = executor.ticker().unwrap();
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut driver = pin!(polling_scope::execute(core::future::pending::<()>(), || {
+        ticker.try_tick();
+    }));
+    assert!(driver.as_mut().poll(&mut cx).is_pending());
+    let task = executor.spawn(async { 7 });
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "enqueue must not notify the busy-polling caller");
+    assert!(driver.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(bevy_tasks::block_on(task), 7);
+
+    // Positive control: the previous waiting API registers a sleeper and wakes
+    // the caller when a runnable is enqueued, even though the caller cannot park.
+    let mut waiting = pin!(ticker.tick());
+    assert!(waiting.as_mut().poll(&mut cx).is_pending());
+    let task = executor.spawn(async { 8 });
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    assert!(waiting.as_mut().poll(&mut cx).is_ready());
+    assert_eq!(bevy_tasks::block_on(task), 8);
+}
+
+#[test]
+fn polling_drives_each_executor_and_repolls_pending_tasks_on_the_owner() {
+    let executors = [ThreadExecutor::new(), ThreadExecutor::new(), ThreadExecutor::new()];
+    let tickers = executors.each_ref().map(|executor| executor.ticker().unwrap());
+    let owner = std::thread::current().id();
+    let mut tasks = Vec::new();
+    for (index, executor) in executors.iter().enumerate() {
+        tasks.push(executor.spawn(async move {
+            bevy_tasks::futures_lite::future::yield_now().await;
+            assert_eq!(std::thread::current().id(), owner);
+            index
+        }));
+    }
+    let results = async move {
+        let mut values = Vec::new();
+        for task in tasks { values.push(task.await); }
+        values
+    };
+    let mut ticks = 0;
+    let mut driver = pin!(polling_scope::execute(results, || {
+        ticks += 1;
+        for ticker in &tickers { ticker.try_tick(); }
+    }));
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..16 {
+        if let Poll::Ready(values) = driver.as_mut().poll(&mut cx) {
+            assert_eq!(values, vec![0, 1, 2]);
+            return;
+        }
+    }
+    panic!("polling scope failed to finish within deterministic poll budget");
+}
+
+#[test]
+fn ready_results_do_not_tick_and_task_panics_reach_results() {
+    let mut driver = pin!(polling_scope::execute(async { 42 }, || panic!("unnecessary tick")));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert_eq!(driver.as_mut().poll(&mut cx), Poll::Ready(42));
+
+    let executor = ThreadExecutor::new();
+    let ticker = executor.ticker().unwrap();
+    let task = executor.spawn(std::panic::AssertUnwindSafe(async {
+        panic!("scoped task panic");
+    }).catch_unwind());
+    let mut driver = pin!(polling_scope::execute(task, || { ticker.try_tick(); }));
+    for _ in 0..4 {
+        if let Poll::Ready(result) = driver.as_mut().poll(&mut cx) {
+            assert!(result.is_err());
+            return;
+        }
+    }
+    panic!("task panic was not returned to the scope collector");
+}

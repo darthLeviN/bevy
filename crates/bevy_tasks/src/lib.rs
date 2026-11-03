@@ -114,6 +114,8 @@ cfg::web! {
 cfg::multi_threaded! {
     if {
         mod task_pool;
+        #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+        mod polling_scope;
         mod thread_executor;
 
         pub use task_pool::{Scope, TaskPool, TaskPoolBuilder};

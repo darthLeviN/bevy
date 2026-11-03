@@ -75,6 +75,8 @@ struct SystemTaskMetadata {
     is_send: bool,
     /// Is `true` if the system is exclusive.
     is_exclusive: bool,
+    /// Is `true` if the system has deferred buffers to apply after running.
+    has_deferred: bool,
 }
 
 /// The result of running a system that is sent across a channel.
@@ -171,6 +173,7 @@ impl SystemExecutor for MultiThreadedExecutor {
                 dependents: schedule.system_dependents[index].clone(),
                 is_send: schedule.systems[index].system.is_send(),
                 is_exclusive: schedule.systems[index].access.is_exclusive(),
+                has_deferred: schedule.systems[index].system.has_deferred(),
             });
             // A system with no dependencies is a starting system.
             if schedule.system_dependencies[index] == 0 {
@@ -510,6 +513,14 @@ impl ExecutorState {
                 self.num_running_systems += 1;
 
                 if self.system_task_metadata[system_index].is_exclusive {
+                    // With no deferred buffers, this barrier has no world work.
+                    // Complete it under the existing state lock rather than clone
+                    // a bitset and queue an exclusive task just to report success.
+                    if self.unapplied_systems.is_clear() && is_apply_deferred(&**system) {
+                        self.finish_system_and_handle_dependents(SystemResult { system_index });
+                        check_for_new_ready_systems = true;
+                        continue;
+                    }
                     // SAFETY: `can_run` returned true for this system,
                     // which means no systems are currently borrowed.
                     unsafe {
@@ -743,7 +754,9 @@ impl ExecutorState {
         self.num_running_systems -= 1;
         self.running_systems.remove(system_index);
         self.completed_systems.insert(system_index);
-        self.unapplied_systems.insert(system_index);
+        if self.system_task_metadata[system_index].has_deferred {
+            self.unapplied_systems.insert(system_index);
+        }
 
         self.signal_dependents(system_index);
     }

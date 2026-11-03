@@ -1,6 +1,8 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Bevy O3 rendering benchmark</title></head>
+<head><meta charset="utf-8"><title>Bevy O3 rendering benchmark</title>
+<script id="benchmark-config" type="application/json">{"movingMeshes":1,"workers":4,"cpuWork":0}</script>
+</head>
 <body>
 <canvas id="scene" width="1280" height="720"></canvas>
 <pre id="result"></pre>
@@ -25,12 +27,13 @@
 </script>
 <script type="module">
   try {
+    const { pageConfiguration } = await import('./options.mjs');
+    const defaults = JSON.parse(document.querySelector('#benchmark-config').textContent);
+    const config = pageConfiguration(new URL(location.href).searchParams, defaults);
     const { default: init, start } = await import('./pkg/wasm_render_bench.js');
     await init();
-    const mode = new URL(location.href).searchParams.get('mode');
-    if (!['serial', 'threaded'].includes(mode)) throw Error('Expected serial or threaded mode');
-    await start(mode === 'threaded', new URL('./pkg/wasm_render_bench.js', location.href).href,
-      new URL('./pool-worker.mjs', location.href).href);
+    await start(config.threaded, new URL('./pkg/wasm_render_bench.js', location.href).href,
+      new URL('./pool-worker.mjs', location.href).href, config.workers, config.movingMeshes, config.cpuWork);
   } catch (error) { window.benchmarkFail(error); }
 </script>
 </body>
