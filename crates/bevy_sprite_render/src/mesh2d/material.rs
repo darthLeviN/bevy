@@ -1257,6 +1257,7 @@ where
             &material,
             material_id,
             material_param,
+            &[],
             &material_layout,
             bind_group_allocators,
             render_device,
