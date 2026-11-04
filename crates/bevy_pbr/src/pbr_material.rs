@@ -1078,10 +1078,60 @@ pub struct StandardMaterialUniform {
     pub deferred_lighting_pass_id: u32,
 }
 
+#[cfg(test)]
+mod material_cpu_uniform_tests {
+    use super::*;
+
+    fn bytes(uniform: &StandardMaterialUniform) -> Vec<u8> {
+        let mut buffer = encase::UniformBuffer::new(Vec::new());
+        buffer.write(uniform).unwrap();
+        buffer.into_inner()
+    }
+
+    #[test]
+    fn material_cpu_uniform_matches_conversion_and_format_flags() {
+        let images = RenderAssets::<GpuImage>::default();
+        for alpha_mode in [AlphaMode::Opaque, AlphaMode::Mask(0.23), AlphaMode::Blend,
+            AlphaMode::Premultiplied, AlphaMode::Add, AlphaMode::Multiply, AlphaMode::AlphaToCoverage] {
+            let material = StandardMaterial {
+                alpha_mode, anisotropy_rotation: 0.37, specular_transmission: 0.6,
+                diffuse_transmission: 0.2, clearcoat: 0.7, double_sided: true,
+                flip_normal_map_y: true, normal_map_texture: Some(Handle::default()),
+                metallic_roughness_texture: Some(Handle::default()),
+                ..Default::default()
+            };
+            let expected = bytes(&material.as_bind_group_shader_type(&images));
+            assert_eq!(expected, bytes(&material.uniform_from_texture_formats(None, None)));
+            for format in [TextureFormat::Rg8Unorm, TextureFormat::Rg16Unorm,
+                TextureFormat::Bc5RgUnorm, TextureFormat::EacRg11Unorm, TextureFormat::Rgba8Unorm] {
+                let uniform = material.uniform_from_texture_formats(Some(format), Some(format));
+                let flags = StandardMaterialFlags::from_bits_retain(uniform.flags);
+                assert_eq!(flags.contains(StandardMaterialFlags::METALLIC_ROUGHNESS_RG), format.channels() == TextureChannel::RG);
+                assert_eq!(flags.contains(StandardMaterialFlags::TWO_COMPONENT_NORMAL_MAP), format != TextureFormat::Rgba8Unorm);
+                assert!(flags.contains(StandardMaterialFlags::FLIP_NORMAL_MAP_Y));
+                assert_eq!(uniform.alpha_cutoff, if let AlphaMode::Mask(cutoff) = alpha_mode { cutoff } else { 0.5 });
+            }
+        }
+    }
+}
+
 impl AsBindGroupShaderType<StandardMaterialUniform> for StandardMaterial {
     fn as_bind_group_shader_type(
         &self,
         images: &RenderAssets<GpuImage>,
+    ) -> StandardMaterialUniform {
+        self.uniform_from_texture_formats(
+            self.metallic_roughness_texture.as_ref().and_then(|handle| images.get(handle.id())).map(|image| image.texture_descriptor.format),
+            self.normal_map_texture.as_ref().and_then(|handle| images.get(handle.id())).map(|image| image.texture_descriptor.format),
+        )
+    }
+}
+
+impl StandardMaterial {
+    fn uniform_from_texture_formats(
+        &self,
+        metallic_roughness_format: Option<TextureFormat>,
+        normal_map_format: Option<TextureFormat>,
     ) -> StandardMaterialUniform {
         let uses_screen_space_specular_transmission =
             self.uses_screen_space_specular_transmission();
@@ -1092,11 +1142,9 @@ impl AsBindGroupShaderType<StandardMaterialUniform> for StandardMaterial {
         if self.emissive_texture.is_some() {
             flags |= StandardMaterialFlags::EMISSIVE_TEXTURE;
         }
-        if let Some(handle) = &self.metallic_roughness_texture {
+        if self.metallic_roughness_texture.is_some() {
             flags |= StandardMaterialFlags::METALLIC_ROUGHNESS_TEXTURE;
-            if images.get(handle.id()).is_some_and(|texture| {
-                texture.texture_descriptor.format.channels() == TextureChannel::RG
-            }) {
+            if metallic_roughness_format.is_some_and(|format| format.channels() == TextureChannel::RG) {
                 flags |= StandardMaterialFlags::METALLIC_ROUGHNESS_RG;
             }
         }
@@ -1162,9 +1210,8 @@ impl AsBindGroupShaderType<StandardMaterialUniform> for StandardMaterial {
 
         let has_normal_map = self.normal_map_texture.is_some();
         if has_normal_map {
-            let normal_map_id = self.normal_map_texture.as_ref().map(Handle::id).unwrap();
-            if let Some(texture) = images.get(normal_map_id) {
-                match texture.texture_descriptor.format {
+            if let Some(format) = normal_map_format {
+                match format {
                     // Dedicated 2-component unorm formats.
                     TextureFormat::Rg8Unorm
                     | TextureFormat::Rg16Unorm
@@ -1412,6 +1459,26 @@ impl From<&StandardMaterial> for StandardMaterialKey {
 }
 
 impl Material for StandardMaterial {
+    fn cpu_preparation<'a>(
+        &'a self,
+        (images, _, _): &mut bevy_ecs::system::SystemParamItem<Self::Param>,
+    ) -> Option<crate::material::MaterialCpuJob<'a>> {
+        let metallic_roughness_format = self.metallic_roughness_texture.as_ref()
+            .and_then(|handle| images.get(handle.id())).map(|image| image.texture_descriptor.format);
+        let normal_map_format = self.normal_map_texture.as_ref()
+            .and_then(|handle| images.get(handle.id())).map(|image| image.texture_descriptor.format);
+        Some(Box::new(move |mut data| {
+            let uniform = self.uniform_from_texture_formats(metallic_roughness_format, normal_map_format);
+            let mut bytes = data.pop().map_or_else(Vec::new, |(_, bytes)| bytes);
+            bytes.clear();
+            let mut buffer = encase::UniformBuffer::new(bytes);
+            buffer.write(&uniform).unwrap();
+            data.clear();
+            data.push((0, buffer.into_inner()));
+            data
+        }))
+    }
+
     fn fragment_shader() -> ShaderRef {
         shader_ref(bevy_asset::embedded_path!("render/pbr.wesl"))
     }

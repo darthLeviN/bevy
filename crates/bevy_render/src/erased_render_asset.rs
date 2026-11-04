@@ -73,6 +73,14 @@ pub trait ErasedRenderAsset: Send + Sync + 'static {
         param: &mut SystemParamItem<Self::Param>,
     ) -> Result<Self::ErasedAsset, PrepareAssetError<Self::SourceAsset>>;
 
+    /// Optional CPU preprocessing for the pending batch, before owner-thread preparation.
+    /// The default preserves the per-asset preparation path.
+    fn prepare_cpu_assets<'a>(
+        _assets: impl Iterator<Item = (AssetId<Self::SourceAsset>, &'a Self::SourceAsset)>,
+        _param: &mut SystemParamItem<Self::Param>,
+    ) {
+    }
+
     /// Called whenever the [`ErasedRenderAsset::SourceAsset`] has been removed.
     ///
     /// You can implement this method if you need to access ECS data (via
@@ -173,8 +181,6 @@ pub struct ExtractedAssets<A: ErasedRenderAsset> {
     /// These assets will not be present in [`ExtractedAssets::extracted`].
     pub removed: HashSet<AssetId<A::SourceAsset>>,
 
-    /// IDs of the assets that were modified this frame.
-    pub modified: HashSet<AssetId<A::SourceAsset>>,
 
     /// IDs of the assets that were added this frame.
     pub added: HashSet<AssetId<A::SourceAsset>>,
@@ -185,7 +191,7 @@ impl<A: ErasedRenderAsset> Default for ExtractedAssets<A> {
         Self {
             extracted: Default::default(),
             removed: Default::default(),
-            modified: Default::default(),
+
             added: Default::default(),
         }
     }
@@ -285,7 +291,7 @@ pub(crate) fn extract_erased_render_asset<A: ErasedRenderAsset>(
 ) {
     extracted_assets.extracted.clear();
     extracted_assets.removed.clear();
-    extracted_assets.modified.clear();
+
     extracted_assets.added.clear();
     needs_extracting.clear();
 
@@ -313,15 +319,16 @@ pub(crate) fn extract_erased_render_asset<A: ErasedRenderAsset>(
                     }
                     AssetEvent::Modified { id } => {
                         needs_extracting.insert(*id);
-                        extracted_assets.modified.insert(*id);
+
                     }
                     AssetEvent::Removed { .. } => {
-                        // We don't care that the asset was removed from Assets<T> in the main world.
+                        // Removing a source with Assets::remove after preparation leaves it renderable
+                        // while a strong handle remains; removing it before extraction would prevent preparation.
                         // An asset is only removed from ErasedRenderAssets<T> when its last handle is dropped (AssetEvent::Unused).
                     }
                     AssetEvent::Unused { id } => {
                         needs_extracting.remove(id);
-                        extracted_assets.modified.remove(id);
+
                         extracted_assets.removed.insert(*id);
                     }
                     AssetEvent::LoadedWithDependencies { .. } => {
@@ -367,6 +374,12 @@ impl<A: ErasedRenderAsset> Default for PrepareNextFrameAssets<A> {
     }
 }
 
+// Preserve removal-before-preparation semantics while exposing its destructor CPU.
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn drop_previous_prepared_asset<T>(remove: impl FnOnce() -> T) {
+    drop(remove());
+}
+
 /// This system prepares all assets of the corresponding [`ErasedRenderAsset::SourceAsset`] type
 /// which where extracted this frame for the GPU.
 pub fn prepare_erased_assets<A: ErasedRenderAsset>(
@@ -380,6 +393,13 @@ pub fn prepare_erased_assets<A: ErasedRenderAsset>(
 
     let mut param = param.into_inner();
     let queued_assets = core::mem::take(&mut prepare_next_frame.assets);
+    A::prepare_cpu_assets(
+        queued_assets.iter()
+            .filter(|(id, _)| !extracted_assets.removed.contains(id) && !extracted_assets.added.contains(id))
+            .chain(extracted_assets.extracted.iter())
+            .map(|(id, asset)| (*id, asset)),
+        &mut param,
+    );
     for (id, extracted_asset) in queued_assets {
         if extracted_assets.removed.contains(&id) || extracted_assets.added.contains(&id) {
             // skip previous frame's assets that have been removed or updated
@@ -427,7 +447,7 @@ pub fn prepare_erased_assets<A: ErasedRenderAsset>(
         // we remove previous here to ensure that if we are updating the asset then
         // any users will not see the old asset after a new asset is extracted,
         // even if the new asset is not yet ready or we are out of bytes to write.
-        render_assets.remove(id);
+        drop_previous_prepared_asset(|| render_assets.remove(id));
 
         let write_bytes = if let Some(size) = A::byte_len(&extracted_asset) {
             if bpf.exhausted() {

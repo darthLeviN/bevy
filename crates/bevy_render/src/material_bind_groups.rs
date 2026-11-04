@@ -29,7 +29,7 @@ use crate::{
     erased_render_asset::PrepareAssetError,
     render_asset::RenderAssets,
     render_resource::{
-        AsBindGroup, AsBindGroupError, BindGroupBuilder, BindlessSlabResourceLimit,
+        AsBindGroup, AsBindGroupError, BindGroupBuilder, BindingResourceKey, BindlessSlabResourceLimit,
         OwnedBindingResource, PipelineCache, UnpreparedBindingResource, UnpreparedBindingResources,
     },
     storage::ShaderBuffer,
@@ -37,7 +37,7 @@ use crate::{
 };
 use crate::{
     render_resource::{
-        BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindingNumber, BindingResource,
+        BindGroup, BindGroupId, BindGroupEntry, BindGroupLayoutDescriptor, BindingNumber, BindingResource,
         BindlessDescriptor, BindlessIndex, BindlessIndexTableDescriptor, BindlessResourceType,
         Buffer, BufferBinding, BufferDescriptor, BufferId, BufferInitDescriptor, BufferUsages,
         CompareFunction, FilterMode, MipmapFilterMode, PreparedBindGroup, RawBufferVec, Sampler,
@@ -2383,6 +2383,7 @@ fn init_fallback_resources(mut commands: Commands, render_device: Res<RenderDevi
 
 // Validate every binding before changing any retained bytes: a failed update must
 // leave the old material intact until its replacement has been prepared.
+#[cfg_attr(target_arch = "wasm32", inline(never))]
 fn update_non_bindless_data(
     bindings: &mut crate::render_resource::BindingResources,
     builder: &BindGroupBuilder,
@@ -2453,6 +2454,7 @@ impl MaterialBindGroupNonBindlessAllocator {
     }
 
     fn write_buffers(&mut self, queue: &RenderQueue) {
+        material_prepare_retained_uniform_write(|| {
         for group in self.dirty_uniforms.drain() {
             let Some(MaterialNonBindlessAllocatedBindGroup::Prepared {
                 bind_group, uniform_buffers, ..
@@ -2467,7 +2469,8 @@ impl MaterialBindGroupNonBindlessAllocator {
                 }
             }
         }
-        self.uniform_pages.upload(|buffer, offset, bytes| queue.write_buffer(buffer, offset, bytes));
+        });
+        material_prepare_page_upload(|| self.uniform_pages.upload(|buffer, offset, bytes| queue.write_buffer(buffer, offset, bytes)));
     }
 
     /// Inserts a bind group, either unprepared or prepared, into this allocator
@@ -2865,7 +2868,88 @@ impl MaterialBindGroupAllocators {
     }
 }
 
+/// CPU-only snapshot: no GPU wrappers cross the worker boundary. A snapshot is
+/// validated on workers; commit also checks the GPU bind group's cached CPU ID,
+/// rejecting stale snapshots after replacement, slot reuse or device recovery.
+pub struct MaterialUniformUpdateSnapshot {
+    gpu_group_id: BindGroupId,
+    layout: BindGroupLayoutDescriptor,
+    resources: Vec<(u32, BindingResourceKey)>,
+    uniforms: Vec<(u32, usize, usize)>,
+}
+
+impl MaterialUniformUpdateSnapshot {
+    pub fn matches(
+        &self,
+        layout: &BindGroupLayoutDescriptor,
+        resources: &[(u32, BindingResourceKey)],
+        data: &[(u32, Vec<u8>)],
+    ) -> bool {
+        self.layout == *layout && self.resources == resources
+            && self.uniforms.len() == data.len()
+            && self.uniforms.iter().zip(data).all(|((binding, size, _), (new_binding, bytes))|
+                binding == new_binding && *size == bytes.len())
+    }
+}
+
 impl RenderMaterialBindings {
+    /// Snapshot identities and uniform sizes without cloning owner-thread handles.
+    pub fn uniform_update_snapshot<M: Asset>(
+        &self,
+        id: AssetId<M>,
+        allocators: &MaterialBindGroupAllocators,
+    ) -> Option<(MaterialBindingId, MaterialUniformUpdateSnapshot)> {
+        let binding = *self.bindings.get(&id.untyped())?;
+        let MaterialBindGroupAllocator::NonBindless(allocator) = allocators.get(&TypeId::of::<M>())? else { return None; };
+        let MaterialNonBindlessAllocatedBindGroup::Prepared { bind_group, layout, uniform_buffers } =
+            allocator.bind_groups.get(*binding.group as usize)?.as_ref()? else { return None; };
+        let mut resources = Vec::new();
+        let mut uniforms = Vec::new();
+        for (position, (index, resource)) in bind_group.bindings.iter().enumerate() {
+            match resource {
+                OwnedBindingResource::TextureView(dimension, view) => resources.push((*index, BindingResourceKey::Texture(*dimension, view.id()))),
+                OwnedBindingResource::Sampler(kind, sampler) => resources.push((*index, BindingResourceKey::Sampler(*kind, sampler.id()))),
+                OwnedBindingResource::Data(data) => uniforms.push((*index, data.len(), position)),
+                _ => return None,
+            }
+        }
+        if uniforms.len() != uniform_buffers.len() { return None; }
+        Some((binding, MaterialUniformUpdateSnapshot {
+            gpu_group_id: bind_group.bind_group.id(), layout: layout.clone(), resources, uniforms,
+        }))
+    }
+
+    /// Commit an already validated CPU update. The allocator remains exclusively
+    /// borrowed on the owner, and only numeric bytes move; no GPU handle is cloned.
+    pub fn commit_uniform_update<M: Asset>(
+        &self,
+        id: AssetId<M>,
+        binding: MaterialBindingId,
+        snapshot: &MaterialUniformUpdateSnapshot,
+        data: &mut [(u32, Vec<u8>)],
+        allocators: &mut MaterialBindGroupAllocators,
+    ) -> bool {
+        if !self.bindings.get(&id.untyped()).is_some_and(|current|
+            current.group == binding.group && current.slot == binding.slot) { return false; }
+        let Some(MaterialBindGroupAllocator::NonBindless(allocator)) = allocators.get_mut(&TypeId::of::<M>()) else { return false; };
+        let Some(Some(MaterialNonBindlessAllocatedBindGroup::Prepared { bind_group, uniform_buffers, .. })) =
+            allocator.bind_groups.get_mut(*binding.group as usize) else { return false; };
+        if bind_group.bind_group.id() != snapshot.gpu_group_id
+            || uniform_buffers.len() != data.len() || snapshot.uniforms.len() != data.len()
+            || !snapshot.uniforms.iter().zip(data.iter()).all(|((index, size, position), (new_index, bytes))| {
+                index == new_index && *size == bytes.len()
+                    && matches!(bind_group.bindings.get(*position), Some((old_index, OwnedBindingResource::Data(old)))
+                        if old_index == index && old.len() == *size)
+            }) { return false; }
+        for ((_, _, position), (_, bytes)) in snapshot.uniforms.iter().zip(data) {
+            if let OwnedBindingResource::Data(retained) = &mut bind_group.bindings[*position].1 {
+                mem::swap(&mut retained.0, bytes);
+            }
+        }
+        allocator.dirty_uniforms.insert(binding.group);
+        true
+    }
+
     /// Prepares a material asset for the render world.
     ///
     /// This method allocates the material in the bind group allocators and
@@ -2875,6 +2959,7 @@ impl RenderMaterialBindings {
         material: &M,
         material_id: AssetId<M>,
         material_param: &mut SystemParamItem<'_, '_, M::Param>,
+        prepared_data: &[(u32, Vec<u8>)],
         material_layout: &BindGroupLayoutDescriptor,
         bind_group_allocators: &mut MaterialBindGroupAllocators,
         render_device: &RenderDevice,
@@ -2885,22 +2970,23 @@ impl RenderMaterialBindings {
     where
         M: AsBindGroup + Asset + Clone,
     {
-        let actual_material_layout = pipeline_cache.get_bind_group_layout(material_layout);
+        let actual_material_layout = material_prepare_get_layout(|| pipeline_cache.get_bind_group_layout(material_layout));
 
         // Ask the material to build the bind group.
-        let result = match material.build_bind_group(
+        let result = match material_prepare_build_bindings(|| material.build_bind_group_with_prepared_data(
             &actual_material_layout,
             render_device,
             material_param,
             false,
             &mut self.bind_group_builder,
-        ) {
+            prepared_data,
+        )) {
             Ok(()) => {
                 let bind_group_allocator =
                     bind_group_allocators.get_mut(&TypeId::of::<M>()).unwrap();
                 // Allocate or update the material.
-                match self.bindings.entry(material_id.into()) {
-                    Entry::Occupied(mut occupied_entry) => {
+                match material_prepare_lookup_binding(|| self.bindings.entry(material_id.into())) {
+                    Entry::Occupied(mut occupied_entry) => material_prepare_validate_update(|| {
                         // First, try a fast path. If none of the GPU resource
                         // bindings have changed, then we can just update the
                         // POD and don't have to update any of the bindings in
@@ -2913,19 +2999,20 @@ impl RenderMaterialBindings {
                         } else {
                             // Otherwise, fall back to the slow path. Deallocate
                             // the GPU resource bindings, and reallocate them.
-                            bind_group_allocator.free(old_binding);
-                            let new_binding = bind_group_allocator
-                                .allocate_unprepared(&mut self.bind_group_builder, material_layout);
+                            let new_binding = material_prepare_replace_allocation(|| {
+                                bind_group_allocator.free(old_binding);
+                                bind_group_allocator.allocate_unprepared(&mut self.bind_group_builder, material_layout)
+                            });
                             *occupied_entry.get_mut() = new_binding;
                             Ok(new_binding)
                         }
-                    }
-                    Entry::Vacant(vacant_entry) => Ok(*vacant_entry.insert(
+                    }),
+                    Entry::Vacant(vacant_entry) => material_prepare_new_allocation(|| Ok(*vacant_entry.insert(
                         bind_group_allocator
                             .allocate_unprepared(&mut self.bind_group_builder, material_layout),
-                    )),
+                    ))),
                 }
-            }
+            },
             Err(AsBindGroupError::RetryNextUpdate) => {
                 Err(PrepareAssetError::RetryNextUpdate((*material).clone()))
             }
@@ -2958,7 +3045,8 @@ impl RenderMaterialBindings {
 
         // Clear out the bind group builder (but retain its heap allocations; we
         // don't want to allocate here).
-        self.bind_group_builder.clear();
+        material_prepare_builder_clear(|| self.bind_group_builder.clear());
+        material_prepare_drop_layout(|| drop(actual_material_layout));
 
         result
     }
@@ -2978,6 +3066,36 @@ impl RenderMaterialBindings {
     }
 }
 
+// Sampling boundaries only: no clocks, tracing, allocation, or per-call recording.
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_lookup_binding<T>(lookup: impl FnOnce() -> T) -> T { lookup() }
+
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_new_allocation<T>(allocate: impl FnOnce() -> T) -> T { allocate() }
+
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_replace_allocation<T>(replace: impl FnOnce() -> T) -> T { replace() }
+
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_drop_layout(drop_layout: impl FnOnce()) { drop_layout() }
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_get_layout<T>(get: impl FnOnce() -> T) -> T { get() }
+
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_build_bindings<T>(build: impl FnOnce() -> T) -> T { build() }
+
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_validate_update<T>(update: impl FnOnce() -> T) -> T { update() }
+
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_builder_clear(clear: impl FnOnce()) { clear() }
+
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_retained_uniform_write(write: impl FnOnce()) { write() }
+
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_page_upload(upload: impl FnOnce()) { upload() }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2989,9 +3107,9 @@ mod tests {
         let (device, queue) = wgpu::Device::noop(&Default::default());
         let device = RenderDevice::new(device);
         let queue = RenderQueue::new(queue);
-        let layout = BindGroupLayoutDescriptor {
-            label: "reuse test".into(),
-            entries: vec![wgpu::BindGroupLayoutEntry {
+        let layout = BindGroupLayoutDescriptor::from_entries(
+            "reuse test",
+            vec![wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
@@ -3001,8 +3119,8 @@ mod tests {
                 },
                 count: None,
             }],
-        };
-        let actual_layout = device.create_bind_group_layout("reuse test", &layout.entries);
+        );
+        let actual_layout = device.create_bind_group_layout("reuse test", layout.entries());
         let mut allocator = MaterialBindGroupNonBindlessAllocator::new("reuse test", layout.clone());
         let slot = allocator.uniform_pages.allocate(&[1; 16], 256, 65536, 65536, |size| {
             device.create_buffer(&BufferDescriptor {
@@ -3036,8 +3154,9 @@ mod tests {
         let Some(MaterialNonBindlessAllocatedBindGroup::Prepared { bind_group, uniform_buffers, .. }) = &allocator.bind_groups[0] else { unreachable!() };
         assert_eq!(bind_group.bind_group.id(), group_id);
         assert_eq!(allocator.uniform_pages.buffer(uniform_buffers[0]).id(), buffer_id);
-        let mut changed_layout = layout.clone();
-        changed_layout.entries[0].visibility = wgpu::ShaderStages::VERTEX;
+        let mut changed_entries = layout.entries().to_vec();
+        changed_entries[0].visibility = wgpu::ShaderStages::VERTEX;
+        let changed_layout = BindGroupLayoutDescriptor::from_entries(layout.label().to_owned(), changed_entries);
         assert!(!allocator.try_update_data(binding, &builder, &changed_layout));
         assert!(allocator.try_update_data(binding, &builder, &layout));
         allocator.free(binding);

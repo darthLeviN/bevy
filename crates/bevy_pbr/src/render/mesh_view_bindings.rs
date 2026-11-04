@@ -602,21 +602,17 @@ impl MeshPipelineViewLayouts {
         }
 
         MeshPipelineViewLayout {
-            main_layout: BindGroupLayoutDescriptor {
-                label: layout_key.label().into(),
-                entries: core::mem::take(&mut entries[0]),
-            },
-            binding_array_layout: BindGroupLayoutDescriptor {
-                label: layout_key
+            main_layout: BindGroupLayoutDescriptor::from_entries(
+                layout_key.label(),
+                core::mem::take(&mut entries[0]),
+            ),
+            binding_array_layout: BindGroupLayoutDescriptor::from_entries(
+                layout_key
                     .label()
-                    .replace("mesh_view_layout:", "mesh_view_layout_binding_array:")
-                    .into(),
-                entries: core::mem::take(&mut entries[1]),
-            },
-            empty_layout: BindGroupLayoutDescriptor {
-                label: "mesh_view_layout_empty".into(),
-                entries: vec![],
-            },
+                    .replace("mesh_view_layout:", "mesh_view_layout_binding_array:"),
+                core::mem::take(&mut entries[1]),
+            ),
+            empty_layout: BindGroupLayoutDescriptor::new("mesh_view_layout_empty", &[]),
         }
     }
 }

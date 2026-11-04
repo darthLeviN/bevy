@@ -79,7 +79,7 @@ export function cpuAccounting(profile, result, functionNames = new Map()) {
     if (schema?.threadCPUDelta === undefined || !data?.length) return unavailable('Firefox OS thread CPU deltas unavailable');
     let cpuDelta = 0, previous, first, last, boundaryMaxMs = 0, count = 0;
     let wasmDelta = 0, missingStackDelta = 0, stackSamples = 0, wasmSamples = 0, unresolvedSymbolSamples = 0;
-    const stacks = new Map(), categoryCache = new Map(), categories = {}, commandCategories = {};
+    const stacks = new Map(), categoryCache = new Map(), categories = {}, commandCategories = {}, materialCategories = {}, materialParents = {}, bindingCategories = {};
     for (const sample of data) {
       const time = sample[schema.time];
       if (!Number.isFinite(time) || (previous !== undefined && time <= previous)) {
@@ -99,11 +99,23 @@ export function cpuAccounting(profile, result, functionNames = new Map()) {
         if (wasm === true) {
                   wasmDelta += delta; wasmSamples++;
                   if (!categoryCache.has(stack)) categoryCache.set(stack, stackAttribution(thread, stack, functionNames));
-                  const { category, command, unresolved } = categoryCache.get(stack);
+                  const { category, command, unresolved, material, binding } = categoryCache.get(stack);
                                     if (unresolved) unresolvedSymbolSamples++;
                   const entry = categories[category] ??= { cpu_ms: 0, samples: 0 };
                   entry.cpu_ms += delta * millisecondsPerUnit;
                   entry.samples++;
+                  if (material) {
+                    for (const [entries, key] of [[materialCategories, material], [materialParents, category]]) {
+                      const child = entries[key] ??= { cpu_ms: 0, samples: 0 };
+                      child.cpu_ms += delta * millisecondsPerUnit;
+                      child.samples++;
+                    }
+                  }
+                  if (binding) {
+                    const child = bindingCategories[binding] ??= { cpu_ms: 0, samples: 0 };
+                    child.cpu_ms += delta * millisecondsPerUnit;
+                    child.samples++;
+                  }
                   if (command) {
                     const child = commandCategories[command] ??= { cpu_ms: 0, samples: 0 };
                     child.cpu_ms += delta * millisecondsPerUnit;
@@ -123,7 +135,8 @@ export function cpuAccounting(profile, result, functionNames = new Map()) {
       return unavailable('Profiler samples do not cover the complete CPU window');
     }
     rows.push({ pid: thread.pid, tid: thread.tid, name: thread.name,
-      role: thread === main ? 'main' : 'worker', categories, command_categories: commandCategories, cpu_ms: cpuDelta * millisecondsPerUnit,
+      role: thread === main ? 'main' : 'worker', categories, command_categories: commandCategories,
+            material_categories: materialCategories, material_parents: materialParents, binding_categories: bindingCategories, cpu_ms: cpuDelta * millisecondsPerUnit,
       sampled_wasm_cpu_ms: wasmDelta * millisecondsPerUnit,
       other_or_unclassified_cpu_ms: (cpuDelta - wasmDelta) * millisecondsPerUnit,
       missing_stack_cpu_ms: missingStackDelta * millisecondsPerUnit,

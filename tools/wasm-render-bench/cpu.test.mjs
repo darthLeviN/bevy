@@ -70,6 +70,30 @@ test('command children conserve parent OS CPU and samples independently in both 
   expect(unresolved.breakdown.rows.find(row => row.id === 'unclassified').samples).toBe(4);
 });
 
+test('material children preserve OS delta weights, broad parents and command overlap without adding CPU', () => {
+  const profile = withStacks(fixture());
+  for (const t of profile.processes[0].threads) {
+    t.stringTable[1] = 'wasm-function[7]';
+    t.stringTable[2] = 'wasm-function[8]';
+    t.stringTable[3] = 'wgpu::Queue::write_buffer';
+    t.samples.data[3][2] = 1;
+    t.samples.data[3][1] *= 3;
+  }
+  const cpu = cpuAccounting(profile, result, new Map([
+    [7, 'bevy_render::material_bind_groups::material_prepare_page_upload'],
+    [8, 'bevy_render::erased_render_asset::prepare_erased_assets<bevy_pbr::MeshMaterial3d<bevy_pbr::StandardMaterial>>'],
+  ])).application_cpu;
+  const detail = cpu.breakdown.material_breakdown;
+  for (const key of ['main_cpu_ms', 'workers_cpu_ms', 'total_cpu_ms', 'samples']) {
+    expect(detail.rows.reduce((s, r) => s + r[key], 0)).toBeCloseTo(detail.parents.reduce((s, r) => s + r[key], 0), 12);
+    expect(detail.rows.reduce((s, r) => s + r[key], 0)).toBeCloseTo(cpu.breakdown.rows.reduce((s, r) => s + r[key], 0), 12);
+  }
+  expect(detail.rows.find(row => row.id === 'page_upload').total_cpu_ms).toBe(12);
+  expect(detail.parents.find(row => row.id === 'render_commands').total_cpu_ms).toBe(3);
+  expect(cpu.breakdown.command_breakdown.rows.find(row => row.id === 'uploads_copies').total_cpu_ms).toBe(3);
+  expect(cpu.total_cpu_ms).toBe(12);
+});
+
 test('missing stacks and no identifiable Wasm are unavailable, not application zero', () => {
   for (const mutate of [
     p => { delete p.processes[0].threads[1].stackTable; },

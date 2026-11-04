@@ -902,6 +902,72 @@ artifacts without CPU markers as unavailable. No browser execution was used to
 verify this feature; tests and compilation do not prove live GPU timing delivery.
 `profile.mjs` retains the existing workload/worker CLI options.
 
+#### Exclusive material-preparation CPU substeps (2026-11-03)
+
+The root runner now prints material substeps to three decimals, with main/worker/
+total CPU means per update and sample counts. These are the same Firefox OS
+`threadCPUDelta` weights as the broad breakdown, never wall/frame durations.
+`material_breakdown` is an exclusive **cross-cut**, not another additive total:
+its `parents` identify the portions of actual broad categories covered, including
+extraction, render preparation and synchronous backend calls. Substep CPU and
+sample sums conserve those parent portions independently for each role. They do
+not sum to the whole asset/material category, which also includes non-material
+assets and work whose material context is not visible. Command detail can describe
+the same samples; do not add either detail table to the broad rows.
+
+Small Wasm-only `inline(never)` call boundaries expose binding construction,
+validation/update, builder clear, properties/keys/shader/draw-metadata rebuilding,
+retained uniform page CPU writes, and separate page uploads. The existing removal
+before replacement remains unchanged; its boundary includes map removal and old
+prepared-value destruction, not exclusively destructor instructions. These helpers
+record no clocks, events, allocations or counts. Their call/optimization overhead
+has not been isolated with an uninstrumented control. Source extraction is the
+whole visible material extraction context, not a claim of clone-only self CPU.
+Generic Arc drops and memory copies require a material ancestor; innermost
+recognized substeps win, and opaque material work remains explicitly unresolved.
+A zero-sample row means unknown actual CPU, not proof of zero work.
+
+Authorized command (two fresh headless browsers; readiness, five-second warmup,
+five-second sample and owned cleanup):
+`bun bevy-benchmark/run.mjs --headless --meshes 10000 --workers 4 --cpu-work 1`.
+It completed once, producing
+`.cache/bevy-web-ecs/render-results/2026-11-03T17-33-28.611Z.json` and its referenced
+raw CPU profiles. A subsequent **offline-only** re-analysis with the same served
+binary corrected the extraction matcher to the actual engine symbol
+`extract_erased_render_asset`; the original saved report predates that correction.
+The following table records the corrected offline attribution, with no second
+browser run:
+
+| Material substep | 4-worker CPU ms/update (samples) | Serial CPU ms/update (samples) |
+| --- | ---: | ---: |
+| Extraction / source clone | 3.903 (25) | 2.536 (16) |
+| Old prepared properties removal/drop | 5.968 (38) | 5.093 (32) |
+| Build bindings / uniform conversion | 4.713 (30) | 5.243 (33) |
+| Validate / retained data update | 5.341 (34) | 4.770 (30) |
+| Builder clear | 2.986 (19) | 3.982 (25) |
+| Rebuild properties / keys / metadata | 4.240 (27) | 3.977 (25) |
+| Retained uniform page CPU write | 3.146 (20) | 3.346 (21) |
+| Page upload, separate | 1.101 (7) | 0.637 (4) |
+| Material unresolved | 4.237 (27) | 4.608 (29) |
+| Covered material CPU (sum of rounded rows) | 35.635 (227) | 34.192 (215) |
+
+All material samples were on main. Classified/covered samples were 200/227 and
+186/215; unresolved Wasm-index samples were zero. Total application CPU was
+79.29 ms/update (75.66 main + 3.63 workers) versus serial 76.49 ms/update.
+Cadence was 12.45 versus 12.22 updates/s; disjoint timestamped GPU passes were
+0.11 ms/frame in both. The largest identified material substep was removal/drop
+with four workers and binding construction in serial. These are statistical
+rankings from one profiled pair, not exact timers or proof of a speedup. The
+material cross-cut is wider than the previously quoted 11–12 ms broad category;
+its greater sum is not additional CPU or an equivalent parent comparison.
+
+Focused verification: `bun test` on `breakdown.test.mjs`, `cpu.test.mjs`,
+`run.test.mjs`, and `contributors.test.mjs` passed 52 tests/397 assertions. Fixtures
+cover nested exclusive attribution, contextual generic drops, actual extraction
+symbols, OS-delta weighting, command overlap and role-wise parent conservation.
+The cached O3 Wasm build and wasm-bindgen generation passed; offline re-analysis
+also checked CPU and sample conservation against the real captured profiles.
+
 Run deterministic CPU accounting and runner checks from the repository root:
 `bun test src/bevy/tools/wasm-render-bench/cpu.test.mjs src/bevy/tools/wasm-render-bench/run.test.mjs src/bevy/tools/wasm-render-bench/capture.test.mjs editor-benchmark/shared_browser.test.mjs`.
 The shared `editor-benchmark/profile.mjs` reader also respects declared CPU units
@@ -925,6 +991,60 @@ readiness-gated five-second warmup/sample and owned cleanup. The ordinary
 (`2026-11-03T08-33-56.703Z.json`). These runs did not reproduce or explain the
 reported visible-browser approximately 1 ms penalty. No engine scheduling fix
 was justified by this evidence; worker broadcast/barrier attribution remains open.
+
+### Batched material validation and retained-binding fast path (2026-11-04)
+
+The CPU batch now snapshots resolved texture/sampler IDs without cloning GPU
+wrappers. Workers serialize uniforms, validate these IDs/layouts/sizes against a
+retained allocation snapshot, and reuse or rebuild CPU material properties. This
+uses the existing single dispatch stage: disjoint slices of one jobs vector,
+at most one task per participating worker, an approximately 110% caller share,
+and minimum 256-material worker shares. Small and zero-worker batches retain the
+inline path. The redundant intermediate assets vector was removed, and resource
+identity scratch vectors are recycled.
+
+On a compatible non-bindless update, the owner checks the material's current
+binding and the cached CPU ID of the actual GPU bind group, checks uniform slots,
+then swaps serialized byte vectors into retained storage and marks it dirty.
+This avoids rebuilding temporary texture/sampler bindings, full owner-side
+resource comparisons, copying uniform payloads, and clearing temporary wrappers.
+The displaced byte vectors become next update's serialization scratch storage.
+No GPU wrappers are accessed, cloned or destroyed by the new worker validation.
+
+Resource replacement (including hot reload with the same source asset handle),
+layout/size changes, missing resources, stale/recycled GPU groups, new/unprepared
+allocations, bindless allocations, and unsupported/custom binding forms retain
+the full preparation path. The immutable snapshot uses resolved GPU-resource IDs,
+not only asset handles or hashes; equality remains collision-safe. Owner-side
+binding resolution and uploads remain thread-affine.
+
+Matched O3 headless captures, 10,000 moving meshes / 10,001 unique materials,
+CPU work 1, fresh browser per case and readiness-gated five-second warmup/sample:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Threaded main CPU ms/update | 65.91 | 45.05 |
+| Threaded worker CPU ms/update | 13.93 | 13.35 |
+| Threaded total CPU ms/update | 79.84 | 58.40 |
+| Threaded updates/sec | 13.95 | 19.83 |
+| Serial total CPU ms/update | 68.65 | 64.05 |
+| Serial updates/sec | 13.64 | 14.49 |
+
+Reports: `.cache/bevy-web-ecs/render-results/2026-11-04T04-57-36.977Z.json`
+and `2026-11-04T05-11-44.198Z.json`. GPU instrumented-pass duration remained
+approximately 0.11 ms/frame. This is one before/after pair, not repeatability
+statistics or displayed FPS. The serial control also improved; not every change
+in aggregate time can be causally attributed to the optimization. The result
+combines worker validation with removal of redundant owner-side work, not a
+measurement of parallelism alone.
+
+`material-uniform-update.test.mjs` compiles production snapshot/commit methods
+against resource fakes and tests 10,000 independent updates, concurrent validation,
+multiple uniforms, changed layout/texture/sampler IDs, stale group identity,
+failed commits without partial writes, and fallback for unsupported allocations.
+It does not prove actual rendered texture/color equivalence or device recovery in
+a live browser. Existing property invalidation, partition, hashing, attribution
+and runner tests remain applicable.
 
 ### Earlier failures and supporting changes
 

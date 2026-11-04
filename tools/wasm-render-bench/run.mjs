@@ -41,6 +41,18 @@ export function formatSummary(report) {
               'Operation                                      Main   Workers     Total  Samples',
               ...breakdown.command_breakdown.rows.map(row => `${row.label.padEnd(43)} ${row.main_cpu_ms_per_update.toFixed(4).padStart(8)} ${row.workers_cpu_ms_per_update.toFixed(4).padStart(9)} ${row.total_cpu_ms_per_update.toFixed(4).padStart(9)} ${String(row.samples).padStart(8)}`),
             ] : []),
+            ...(breakdown.material_breakdown ? [
+              '  Material substeps — cross-cut of broad rows, NOT additional CPU (ms/update)',
+              'Operation                                      Main   Workers     Total  Samples',
+              ...breakdown.material_breakdown.rows.map(row => `${row.label.padEnd(43)} ${row.main_cpu_ms_per_update.toFixed(3).padStart(8)} ${row.workers_cpu_ms_per_update.toFixed(3).padStart(9)} ${row.total_cpu_ms_per_update.toFixed(3).padStart(9)} ${String(row.samples).padStart(8)}${row.samples ? '' : '  no samples; actual CPU unknown'}`),
+              ...(breakdown.material_breakdown.build_bindings ? [
+                '    Step 3 children — GPU texture/sampler wrapper clones (already included above):',
+                ...breakdown.material_breakdown.build_bindings.rows.map(row => `${row.label.padEnd(43)} ${row.main_cpu_ms_per_update.toFixed(3).padStart(8)} ${row.workers_cpu_ms_per_update.toFixed(3).padStart(9)} ${row.total_cpu_ms_per_update.toFixed(3).padStart(9)} ${String(row.samples).padStart(8)}${row.samples ? '' : '  no samples; actual CPU unknown'}`),
+              ] : []),
+              '  Material portions by actual broad parent (same CPU as substeps):',
+              ...breakdown.material_breakdown.parents.filter(row => row.samples).map(row => `${row.label.padEnd(43)} ${row.main_cpu_ms_per_update.toFixed(3).padStart(8)} ${row.workers_cpu_ms_per_update.toFixed(3).padStart(9)} ${row.total_cpu_ms_per_update.toFixed(3).padStart(9)} ${String(row.samples).padStart(8)}`),
+              `Material classified/covered samples: ${breakdown.material_breakdown.classified_samples}/${breakdown.material_breakdown.samples}; unresolved is explicit.`,
+            ] : []),
             `Unresolved Wasm-index samples before attribution: ${result.cpu_execution.coverage?.unresolved_symbol_samples ?? 'unavailable'}`,
             breakdown.limitation];
         }),

@@ -2,6 +2,7 @@ use alloc::borrow::Cow;
 use bevy_asset::Handle;
 use bevy_derive::Deref;
 use bevy_mesh::VertexBufferLayout;
+use bevy_platform::hash::Hashed;
 use bevy_shader::{CachedPipelineId, Shader, ShaderDefVal};
 use core::iter;
 use thiserror::Error;
@@ -9,19 +10,46 @@ use wgpu_types::{
     BindGroupLayoutEntry, ColorTargetState, DepthStencilState, MultisampleState, PrimitiveState,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
-pub struct BindGroupLayoutDescriptor {
-    /// Debug label of the bind group layout descriptor. This will show up in graphics debuggers for easy identification.
-    pub label: Cow<'static, str>,
-    pub entries: Vec<BindGroupLayoutEntry>,
+/// An immutable, pre-hashed layout, including when used inside larger cache keys.
+/// Construct a replacement to change its label or entries; clones retain the cached hash.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BindGroupLayoutDescriptor(Hashed<BindGroupLayoutDescriptorData>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BindGroupLayoutDescriptorData {
+    label: Cow<'static, str>,
+    entries: Vec<BindGroupLayoutEntry>,
 }
 
 impl BindGroupLayoutDescriptor {
     pub fn new(label: impl Into<Cow<'static, str>>, entries: &[BindGroupLayoutEntry]) -> Self {
-        Self {
+        Self::from_entries(label, entries.into())
+    }
+
+    /// Takes ownership of entries without copying their allocation.
+    pub fn from_entries(
+        label: impl Into<Cow<'static, str>>,
+        entries: Vec<BindGroupLayoutEntry>,
+    ) -> Self {
+        Self(Hashed::new(BindGroupLayoutDescriptorData {
             label: label.into(),
-            entries: entries.into(),
-        }
+            entries,
+        }))
+    }
+
+    /// Debug label shown in graphics debuggers.
+    pub fn label(&self) -> &str {
+        &self.0.label
+    }
+
+    pub fn entries(&self) -> &[BindGroupLayoutEntry] {
+        &self.0.entries
+    }
+}
+
+impl Default for BindGroupLayoutDescriptor {
+    fn default() -> Self {
+        Self::from_entries("", Vec::new())
     }
 }
 

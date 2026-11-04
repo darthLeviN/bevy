@@ -195,7 +195,7 @@ impl BindGroupLayoutCache {
             RawEntryMut::Occupied(entry) => entry.into_mut(),
             RawEntryMut::Vacant(slot) => {
                 let created = render_device
-                    .create_bind_group_layout(descriptor.label.as_ref(), &descriptor.entries);
+                    .create_bind_group_layout(descriptor.label(), descriptor.entries());
                 slot.insert(descriptor.clone(), created).1
             }
         }

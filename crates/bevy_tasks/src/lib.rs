@@ -34,7 +34,7 @@ pub mod cfg {
 cfg::std! {
     extern crate std;
     mod scope_dispatch;
-    pub use scope_dispatch::with_local_task_scopes;
+    pub use scope_dispatch::{with_cpu_task_scopes, with_local_task_scopes};
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]

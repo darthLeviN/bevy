@@ -75,10 +75,21 @@ wgpu_wrapper! {
 }
 
 /// Describes a [`Texture`] with its associated metadata required by a pipeline or [`BindGroup`](super::BindGroup).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TextureView {
     id: TextureViewId,
     value: WgpuTextureView,
+}
+
+impl Clone for TextureView {
+    // Keep the actual wrapper clone visible to the Wasm CPU sampler.
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            value: self.value.clone(),
+        }
+    }
 }
 
 pub struct SurfaceTexture {
@@ -146,10 +157,21 @@ wgpu_wrapper! {
 ///
 /// May be converted from and dereferences to a wgpu [`Sampler`](wgpu::Sampler).
 /// Can be created via [`RenderDevice::create_sampler`](crate::renderer::RenderDevice::create_sampler).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Sampler {
     id: SamplerId,
     value: WgpuSampler,
+}
+
+impl Clone for Sampler {
+    // Keep the actual wrapper clone visible to the Wasm CPU sampler.
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            value: self.value.clone(),
+        }
+    }
 }
 
 impl Sampler {

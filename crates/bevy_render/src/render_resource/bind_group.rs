@@ -1,7 +1,7 @@
 use crate::{
     material_bind_groups::FallbackBuffer,
     render_asset::RenderAssets,
-    render_resource::{BindGroupLayout, Buffer, PipelineCache, Sampler, TextureView},
+    render_resource::{BindGroupLayout, Buffer, PipelineCache, Sampler, SamplerId, TextureView, TextureViewId},
     renderer::{wgpu_wrapper, RenderDevice},
     storage::{GpuShaderBuffer, ShaderBuffer},
     texture::GpuImage,
@@ -598,6 +598,31 @@ pub trait AsBindGroup {
         output: &mut BindGroupBuilder,
     ) -> Result<(), AsBindGroupError>;
 
+    /// Builds bindings using optional, already serialized CPU data bindings.
+    /// Handwritten implementations retain their original behavior by default.
+    fn build_bind_group_with_prepared_data(
+        &self,
+        layout: &BindGroupLayout,
+        render_device: &RenderDevice,
+        param: &mut SystemParamItem<'_, '_, Self::Param>,
+        force_no_bindless: bool,
+        output: &mut BindGroupBuilder,
+        _prepared_data: &[(u32, Vec<u8>)],
+    ) -> Result<(), AsBindGroupError> {
+        self.build_bind_group(layout, render_device, param, force_no_bindless, output)
+    }
+
+    /// Resolves immutable resource identities without cloning GPU wrappers.
+    /// `false` retains the full binding-building path for unsupported/custom bindings.
+    fn binding_resource_key(
+        &self,
+        _render_device: &RenderDevice,
+        _param: &mut SystemParamItem<'_, '_, Self::Param>,
+        _output: &mut Vec<(u32, BindingResourceKey)>,
+    ) -> Result<bool, AsBindGroupError> {
+        Ok(false)
+    }
+
     /// Creates the bind group layout matching all bind groups returned by
     /// [`AsBindGroup::as_bind_group`]
     fn bind_group_layout(render_device: &RenderDevice) -> BindGroupLayout
@@ -617,10 +642,10 @@ pub trait AsBindGroup {
     where
         Self: Sized,
     {
-        BindGroupLayoutDescriptor {
-            label: Self::label().into(),
-            entries: Self::bind_group_layout_entries(render_device, false),
-        }
+        BindGroupLayoutDescriptor::from_entries(
+            Self::label(),
+            Self::bind_group_layout_entries(render_device, false),
+        )
     }
 
     /// Returns a vec of bind group layout entries.
@@ -814,6 +839,14 @@ pub enum UnpreparedBindingResource {
 /// This corresponds to the `#[data]` attribute in `AsBindGroup`.
 #[derive(Debug, Deref, DerefMut)]
 pub struct OwnedData(pub Vec<u8>);
+
+/// CPU-only identity of a resolved texture or sampler. Resource replacement changes
+/// its ID even when the source asset handle is unchanged (for example, hot reload).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BindingResourceKey {
+    Texture(TextureViewDimension, TextureViewId),
+    Sampler(SamplerBindingType, SamplerId),
+}
 
 impl OwnedBindingResource {
     /// Creates a [`BindingResource`] reference to this

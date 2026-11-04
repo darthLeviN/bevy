@@ -72,6 +72,8 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
 
     let mut binding_states: Vec<BindingState> = Vec::new();
     let mut binding_impls = Vec::new();
+    let mut resource_key_impls = Vec::new();
+    let mut resource_key_supported = true;
     let mut bindless_binding_layouts = Vec::new();
     let mut non_bindless_binding_layouts = Vec::new();
     let mut bindless_resource_types = Vec::new();
@@ -175,6 +177,7 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                 converted_shader_type,
                 binding_array: binding_array_binding,
             } = get_uniform_binding_attr(attr)?;
+            if attr_ident == UNIFORM_ATTRIBUTE_NAME { resource_key_supported = false; }
             match binding_type {
                 UniformBindingAttrType::Uniform => {
                     binding_impls.push(quote! {{
@@ -241,8 +244,11 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                     binding_impls.push(quote! {{
                             use #render_path::render_resource::AsBindGroupShaderType;
                             use #render_path::render_resource::encase::{ShaderType, internal::WriteInto};
-                            let converted: #converted_shader_type = self.as_bind_group_shader_type(&images);
                             let start_offset = output.data_buffer.len();
+                            if let #FQOption::Some((_, bytes)) = prepared_data.iter().find(|(binding, _)| *binding == #binding_index) {
+                                output.data_buffer.extend_from_slice(bytes);
+                            } else {
+                            let converted: #converted_shader_type = self.as_bind_group_shader_type(&images);
                             converted.write_into(
                                 &mut #render_path::render_resource::encase::internal::Writer::new(
                                     &converted,
@@ -253,6 +259,7 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                             let min_size = <#converted_shader_type as #render_path::render_resource::ShaderType>::min_size().get() as usize;
                             while output.data_buffer.len() < start_offset + min_size {
                                 output.data_buffer.push(0);
+                            }
                             }
                             let end_offset = output.data_buffer.len();
                             (
@@ -440,6 +447,7 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
 
             match binding_type {
                 BindingType::Uniform => {
+                    resource_key_supported = false;
                     if attr_bindless_count.is_some() {
                         return Err(Error::new_spanned(
                             attr,
@@ -452,6 +460,7 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                 }
 
                 BindingType::Storage => {
+                    resource_key_supported = false;
                     let StorageAttrs {
                         visibility,
                         binding_array: binding_array_binding,
@@ -557,6 +566,7 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                 }
 
                 BindingType::StorageTexture => {
+                    resource_key_supported = false;
                     if attr_bindless_count.is_some() {
                         return Err(Error::new_spanned(
                             attr,
@@ -640,6 +650,16 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                         )
                     });
 
+                    resource_key_impls.insert(0, quote! {
+                        {
+                            let handle: #FQOption<&#asset_path::Handle<#image_path::Image>> = (&self.#field_name).into();
+                            let image = if let #FQOption::Some(handle) = handle {
+                                images.get(handle).ok_or(#render_path::render_resource::AsBindGroupError::RetryNextUpdate)?
+                            } else { #fallback_image };
+                            key.push((#binding_index, #render_path::render_resource::BindingResourceKey::Texture(
+                                #render_path::render_resource::#dimension, image.texture_view.id())));
+                        }
+                    });
                     sampler_binding_count += 1;
 
                     non_bindless_binding_layouts.push(quote! {
@@ -766,6 +786,22 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                         )
                     });
 
+                    resource_key_impls.insert(0, quote! {
+                        {
+                            let handle: #FQOption<&#asset_path::Handle<#image_path::Image>> = (&self.#field_name).into();
+                            let image = if let #FQOption::Some(handle) = handle {
+                                let image = images.get(handle).ok_or(#render_path::render_resource::AsBindGroupError::RetryNextUpdate)?;
+                                let sample_type = image.texture_descriptor.format.sample_type(#FQOption::None, #FQOption::Some(render_device.features()));
+                                if !sample_type.is_some_and(|sample_type| #expected_samplers.contains(&sample_type)) {
+                                    return #FQResult::Err(#render_path::render_resource::AsBindGroupError::InvalidSamplerType(
+                                        #binding_index, format!("{:?}", sample_type), format!("{:?}", #expected_samplers)));
+                                }
+                                image
+                            } else { #fallback_image };
+                            key.push((#binding_index, #render_path::render_resource::BindingResourceKey::Sampler(
+                                #render_path::render_resource::SamplerBindingType::Filtering, image.sampler.id())));
+                        }
+                    });
                     sampler_binding_count += 1;
 
                     non_bindless_binding_layouts.push(quote!{
@@ -1094,9 +1130,22 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                 &self,
                 layout: &#render_path::render_resource::BindGroupLayout,
                 render_device: &#render_path::renderer::RenderDevice,
+                param: &mut #ecs_path::system::SystemParamItem<'_, '_, Self::Param>,
+                force_no_bindless: bool,
+                output: &mut #render_path::render_resource::BindGroupBuilder,
+            ) -> #FQResult<(), #render_path::render_resource::AsBindGroupError> {
+                self.build_bind_group_with_prepared_data(layout, render_device,
+                    param, force_no_bindless, output, &[])
+            }
+
+            fn build_bind_group_with_prepared_data(
+                &self,
+                layout: &#render_path::render_resource::BindGroupLayout,
+                render_device: &#render_path::renderer::RenderDevice,
                 (images, fallback_image, storage_buffers): &mut #ecs_path::system::SystemParamItem<'_, '_, Self::Param>,
                 force_no_bindless: bool,
                 output: &mut #render_path::render_resource::BindGroupBuilder,
+                prepared_data: &[(u32, ::std::vec::Vec<u8>)],
             ) -> #FQResult<(), #render_path::render_resource::AsBindGroupError> {
                 #uniform_binding_type_declarations
 
@@ -1106,6 +1155,18 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                 )*
 
                 #FQResult::Ok(())
+            }
+
+            fn binding_resource_key(
+                &self,
+                render_device: &#render_path::renderer::RenderDevice,
+                (images, fallback_image, _): &mut #ecs_path::system::SystemParamItem<'_, '_, Self::Param>,
+                key: &mut ::std::vec::Vec<(u32, #render_path::render_resource::BindingResourceKey)>,
+            ) -> #FQResult<bool, #render_path::render_resource::AsBindGroupError> {
+                key.clear();
+                if !#resource_key_supported { return #FQResult::Ok(false); }
+                #(#resource_key_impls)*
+                #FQResult::Ok(true)
             }
 
             #[allow(clippy::unused_unit)]

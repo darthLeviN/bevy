@@ -42,7 +42,7 @@ use bevy_render::erased_render_asset::{
 };
 use bevy_render::material_bind_groups::{
     material_uses_bindless_resources, FallbackBuffer, MaterialBindGroupAllocators,
-    MaterialBindingId, RenderMaterialBindings,
+    MaterialBindingId, MaterialUniformUpdateSnapshot, RenderMaterialBindings,
 };
 use bevy_render::render_asset::{prepare_assets, RenderAssets};
 use bevy_render::storage::GpuShaderBuffer;
@@ -145,6 +145,16 @@ pub const MATERIAL_BIND_GROUP_INDEX: usize = 3;
 /// @group(#{MATERIAL_BIND_GROUP}) @binding(2) var color_sampler: sampler;
 /// ```
 pub trait Material: Asset + AsBindGroup + Clone + Sized {
+    /// Opts into batched CPU preparation. Called on the owner to snapshot metadata.
+    /// The returned job and this material's property/key methods must be safe on workers.
+    /// Custom materials default to the unchanged owner-thread preparation order.
+    fn cpu_preparation<'a>(
+        &'a self,
+        _param: &mut SystemParamItem<Self::Param>,
+    ) -> Option<MaterialCpuJob<'a>> {
+        None
+    }
+
     /// Returns this material's vertex shader. If [`ShaderRef::Default`] is returned, the default mesh vertex shader
     /// will be used.
     fn vertex_shader() -> ShaderRef {
@@ -1621,7 +1631,198 @@ where
     )
 }
 
+// Keep the metadata rebuild visible in sampled Wasm CPU stacks, without timers.
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_properties<T>(build: impl FnOnce() -> T) -> T {
+    build()
+}
+
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_copy_layout<T>(copy: impl FnOnce() -> T) -> T { copy() }
+
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_return(binding: MaterialBindingId, properties: Arc<MaterialProperties>) -> PreparedMaterial {
+    PreparedMaterial { binding, properties }
+}
+
 // orphan rules T_T
+/// A CPU-only preparation closure. It must not capture GPU resources or ECS parameters.
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn material_prepare_cpu_validate<T>(validate: impl FnOnce() -> T) -> T { validate() }
+
+pub type MaterialCpuJob<'a> = Box<dyn FnOnce(Vec<(u32, Vec<u8>)>) -> Vec<(u32, Vec<u8>)> + Send + 'a>;
+
+/// CPU-only results retained until the owner commits this material's bindings.
+pub struct MaterialCpuPreparation {
+    data: Vec<(u32, Vec<u8>)>,
+    properties: Arc<MaterialProperties>,
+    update_snapshot: Option<(MaterialBindingId, MaterialUniformUpdateSnapshot)>,
+    uniform_binding: Option<MaterialBindingId>,
+    resource_scratch: Vec<(u32, bevy_render::render_resource::BindingResourceKey)>,
+}
+
+fn material_cpu_plan(count: usize, workers: usize) -> (usize, Vec<usize>) {
+    const MIN_SHARE: usize = 256;
+    let mut workers = workers.min(count / MIN_SHARE);
+    while workers > 0 {
+        // Ten units per worker, eleven for the caller, rounded toward the caller.
+        let caller = (count * 11).div_ceil(workers * 10 + 11);
+        let worker_count = (count - caller) / workers;
+        if worker_count >= MIN_SHARE {
+            let extra = (count - caller) % workers;
+            return (caller, (0..workers).map(|index| worker_count + usize::from(index < extra)).collect());
+        }
+        workers -= 1;
+    }
+    (count, Vec::new())
+}
+
+fn material_properties_template<M: Material>(
+    param: &SystemParamItem<<MeshMaterial3d<M> as ErasedRenderAsset>::Param>,
+) -> MaterialProperties
+where M::Data: PartialEq + Eq + Hash + Clone {
+    let draws = &param.7;
+    MaterialProperties {
+        render_method: param.2.0,
+        material_layout: Some(param.5.get(&TypeId::of::<M>()).unwrap().bind_group_layout().clone()),
+        draw_functions: SmallVec::from_const([
+            (MainPassOpaqueDrawFunction.intern(), draws.0.read().id::<DrawMaterial>()),
+            (MainPassAlphaMaskDrawFunction.intern(), draws.1.read().id::<DrawMaterial>()),
+            (MainPassTransmissiveDrawFunction.intern(), draws.2.read().id::<DrawMaterial>()),
+            (MainPassTransparentDrawFunction.intern(), draws.3.read().id::<DrawMaterial>()),
+            (PrepassOpaqueDrawFunction.intern(), draws.4.read().id::<DrawPrepass>()),
+            (PrepassAlphaMaskDrawFunction.intern(), draws.5.read().id::<DrawPrepass>()),
+            (PrepassOpaqueDepthOnlyDrawFunction.intern(), draws.4.read().id::<DrawDepthOnlyPrepass>()),
+            (DeferredOpaqueDrawFunction.intern(), draws.6.read().id::<DrawPrepass>()),
+            (DeferredAlphaMaskDrawFunction.intern(), draws.7.read().id::<DrawPrepass>()),
+            (ShadowsDrawFunction.intern(), draws.8.read().id::<DrawPrepass>()),
+            (ShadowsDepthOnlyDrawFunction.intern(), draws.8.read().id::<DrawDepthOnlyPrepass>()),
+        ]),
+        shaders: param.8.shaders.clone(),
+        bindless: material_uses_bindless_resources::<M>(&param.0),
+        base_specialize: Some(base_specialize),
+        prepass_specialize: Some(prepass_specialize),
+        user_specialize: Some(user_specialize::<M>),
+        shadows_enabled: M::enable_shadows(),
+        prepass_enabled: M::enable_prepass(),
+        oit_enabled: M::enable_oit(),
+        ..Default::default()
+    }
+}
+
+fn material_properties_match<M: Material>(material: &M, template: &MaterialProperties, old: &MaterialProperties) -> bool
+where M::Data: PartialEq + Eq + Hash + Clone {
+    let method = match material.opaque_render_method() {
+        OpaqueRendererMethod::Auto => template.render_method,
+        method => method,
+    };
+    old.alpha_mode == material.alpha_mode()
+        && old.depth_bias.to_bits() == material.depth_bias().to_bits()
+        && old.reads_view_transmission_texture == material.reads_view_transmission_texture()
+        && old.render_method == method
+        && old.material_layout == template.material_layout
+        && old.draw_functions == template.draw_functions
+        && old.shaders == template.shaders
+        && old.bindless == template.bindless
+        && old.shadows_enabled == template.shadows_enabled
+        && old.prepass_enabled == template.prepass_enabled
+        && old.oit_enabled == template.oit_enabled
+        && old.material_key.to_key::<M::Data>() == material.bind_group_data()
+}
+
+fn material_properties_from_template<M: Material>(material: &M, template: &MaterialProperties) -> Arc<MaterialProperties>
+where M::Data: PartialEq + Eq + Hash + Clone {
+    let alpha_mode = material.alpha_mode();
+    let reads_view_transmission_texture = material.reads_view_transmission_texture();
+    let render_phase_type = match alpha_mode {
+        _ if reads_view_transmission_texture => RenderPhaseType::Transmissive,
+        AlphaMode::Blend | AlphaMode::Premultiplied | AlphaMode::Add | AlphaMode::Multiply => RenderPhaseType::Transparent,
+        AlphaMode::Opaque | AlphaMode::AlphaToCoverage => RenderPhaseType::Opaque,
+        AlphaMode::Mask(_) => RenderPhaseType::AlphaMask,
+    };
+    Arc::new(MaterialProperties {
+        alpha_mode,
+        depth_bias: material.depth_bias(),
+        reads_view_transmission_texture,
+        render_phase_type,
+        render_method: match material.opaque_render_method() {
+            OpaqueRendererMethod::Auto => template.render_method,
+            method => method,
+        },
+        mesh_pipeline_key_bits: ErasedMeshPipelineKey::new(MeshPipelineKey::empty()),
+        material_layout: material_prepare_copy_layout(|| template.material_layout.clone()),
+        draw_functions: template.draw_functions.clone(),
+        shaders: template.shaders.clone(),
+        bindless: template.bindless,
+        base_specialize: template.base_specialize,
+        prepass_specialize: template.prepass_specialize,
+        user_specialize: template.user_specialize,
+        material_key: ErasedMaterialKey::new(material.bind_group_data()),
+        shadows_enabled: template.shadows_enabled,
+        prepass_enabled: template.prepass_enabled,
+        oit_enabled: template.oit_enabled,
+    })
+}
+
+#[cfg(test)]
+mod material_cpu_tests {
+    use super::*;
+
+    #[test]
+    fn material_cpu_plan_partitions_and_falls_back() {
+        assert_eq!(material_cpu_plan(10000, 4), (2157, vec![1961, 1961, 1961, 1960]));
+        assert_eq!(material_cpu_plan(537, 4), (537, vec![]));
+        assert_eq!(material_cpu_plan(538, 4), (282, vec![256]));
+        for count in [0, 1, 255, 256, 537, 538, 1024, 10000, 10001] {
+            for workers in 0..=32 {
+                let (caller, shares) = material_cpu_plan(count, workers);
+                assert_eq!(caller + shares.iter().sum::<usize>(), count);
+                assert!(shares.len() <= workers);
+                for share in &shares {
+                    assert!(*share >= 256);
+                    assert!(caller.abs_diff((*share * 11).div_ceil(10)) <= 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn material_cpu_properties_preserve_variants_and_keys() {
+        let template = MaterialProperties {
+            render_method: OpaqueRendererMethod::Deferred,
+            bindless: true, shadows_enabled: true, prepass_enabled: true, oit_enabled: false,
+            ..Default::default()
+        };
+        for alpha_mode in [AlphaMode::Opaque, AlphaMode::Mask(0.4), AlphaMode::Blend,
+            AlphaMode::Premultiplied, AlphaMode::Add, AlphaMode::Multiply, AlphaMode::AlphaToCoverage] {
+            for transmission in [0.0, 0.7] {
+                let material = StandardMaterial {
+                    alpha_mode, depth_bias: 1.25, specular_transmission: transmission,
+                    opaque_render_method: OpaqueRendererMethod::Auto,
+                    double_sided: true, unlit: true, clearcoat: 0.6,
+                    ..Default::default()
+                };
+                let properties = material_properties_from_template(&material, &template);
+                assert_eq!(properties.alpha_mode, material.alpha_mode());
+                assert_eq!(properties.depth_bias, material.depth_bias());
+                assert_eq!(properties.reads_view_transmission_texture, material.reads_view_transmission_texture());
+                assert_eq!(properties.render_method, OpaqueRendererMethod::Deferred);
+                assert_eq!(properties.material_key, ErasedMaterialKey::new(material.bind_group_data()));
+                assert_eq!(properties.mesh_pipeline_key_bits, ErasedMeshPipelineKey::new(MeshPipelineKey::empty()));
+                assert!(properties.bindless && properties.shadows_enabled && properties.prepass_enabled);
+                assert!(!properties.oit_enabled);
+                let expected = if material.reads_view_transmission_texture() { RenderPhaseType::Transmissive }
+                    else { match alpha_mode {
+                        AlphaMode::Opaque | AlphaMode::AlphaToCoverage => RenderPhaseType::Opaque,
+                        AlphaMode::Mask(_) => RenderPhaseType::AlphaMask,
+                        _ => RenderPhaseType::Transparent,
+                    }};
+                assert!(properties.render_phase_type == expected);
+            }
+        }
+    }
+}
+
 impl<M: Material> ErasedRenderAsset for MeshMaterial3d<M>
 where
     M::Data: PartialEq + Eq + Hash + Clone,
@@ -1650,7 +1851,80 @@ where
         ),
         SRes<MaterialShaders<M>>,
         M::Param,
+        Local<'static, HashMap<AssetId<M>, MaterialCpuPreparation>>,
     );
+
+    fn prepare_cpu_assets<'a>(
+        assets: impl Iterator<Item = (AssetId<M>, &'a M)>,
+        param: &mut SystemParamItem<Self::Param>,
+    ) {
+        let workers = bevy_tasks::with_cpu_task_scopes(|| bevy_tasks::ComputeTaskPool::get().scope_worker_num());
+        if workers == 0 || assets.size_hint().1.is_some_and(|count| material_cpu_plan(count, workers).1.is_empty()) {
+            param.10.clear();
+            return;
+        }
+        // One job allocation, split into disjoint mutable slices for dispatch.
+        // Do not allocate a second vector just to count the source iterator.
+        let mut jobs: Vec<_> = assets.filter_map(|(id, material)| {
+            material.cpu_preparation(&mut param.9).map(|job| {
+                let mut previous = param.10.remove(&id);
+                let mut resources = previous.as_mut().map_or_else(Vec::new, |previous| core::mem::take(&mut previous.resource_scratch));
+                let resources = material.binding_resource_key(&param.0, &mut param.9, &mut resources)
+                    .ok().filter(|supported| *supported).map(|_| resources);
+                (id, material, Some(job), previous, resources)
+            })
+        }).collect();
+        param.10.clear();
+        if jobs.is_empty() { return; }
+        let template = material_properties_template::<M>(param);
+        let process = |items: &mut [(AssetId<M>, &M, Option<MaterialCpuJob<'_>>, Option<MaterialCpuPreparation>, Option<Vec<(u32, bevy_render::render_resource::BindingResourceKey)>>)]| {
+            for (_, material, job, output, resources) in items {
+                let previous = output.take();
+                let (data, properties, update_snapshot) = match previous {
+                    Some(previous) => (previous.data, Some(previous.properties), previous.update_snapshot),
+                    None => (Vec::new(), None, None),
+                };
+                let data = job.take().unwrap()(data);
+                let properties = material_prepare_properties(|| {
+                    if let Some(properties) = properties {
+                        if material_properties_match(*material, &template, &properties) { return properties; }
+                    }
+                    material_properties_from_template(*material, &template)
+                });
+                // Only CPU IDs, descriptors, lengths and bytes are examined here.
+                // A hot-reloaded image changes the resolved resource ID even if its
+                // source handle is unchanged, forcing owner-side binding rebuilding.
+                let uniform_binding = material_prepare_cpu_validate(|| {
+                    let (binding, snapshot) = update_snapshot.as_ref()?;
+                    snapshot.matches(properties.material_layout.as_ref()?, resources.as_deref()?, &data)
+                        .then_some(*binding)
+                });
+                *output = Some(MaterialCpuPreparation {
+                    data, properties, update_snapshot, uniform_binding,
+                    resource_scratch: resources.take().unwrap_or_default(),
+                });
+            }
+        };
+        bevy_tasks::with_cpu_task_scopes(|| {
+            let pool = bevy_tasks::ComputeTaskPool::get();
+            let (caller_count, shares) = material_cpu_plan(jobs.len(), pool.scope_worker_num());
+            let (caller, mut remaining) = jobs.split_at_mut(caller_count);
+            if remaining.is_empty() {
+                process(caller);
+            } else {
+                pool.scope_with_executor(false, None, |scope| {
+                    for count in shares {
+                        let (items, rest) = remaining.split_at_mut(count);
+                        remaining = rest;
+                        let process = &process;
+                        scope.spawn(async move { process(items); });
+                    }
+                    process(caller);
+                });
+            }
+        });
+        param.10.extend(jobs.into_iter().map(|(id, _, _, output, _)| (id, output.unwrap())));
+    }
 
     fn prepare_asset(
         material: Self::SourceAsset,
@@ -1676,26 +1950,46 @@ where
             ),
             material_shaders,
             material_param,
+            cpu_preparations,
         ): &mut SystemParamItem<Self::Param>,
     ) -> Result<Self::ErasedAsset, PrepareAssetError<Self::SourceAsset>> {
-        let material_layout = bind_group_allocators
+        let mut cpu_preparation = cpu_preparations.get_mut(&material_id);
+        let owner_layout = cpu_preparation.is_none().then(|| material_prepare_copy_layout(|| bind_group_allocators
             .get(&TypeId::of::<M>())
             .unwrap()
             .bind_group_layout()
-            .clone();
-
-        let binding = render_material_bindings.prepare_material(
+            .clone()));
+        let cpu_properties = cpu_preparation.as_ref().map(|prepared| prepared.properties.clone());
+        let material_layout = cpu_properties.as_ref()
+            .and_then(|properties| properties.material_layout.as_ref())
+            .or(owner_layout.as_ref()).unwrap();
+        let reused_binding = cpu_preparation.as_mut().and_then(|prepared| {
+            let binding = prepared.uniform_binding?;
+            let (_, snapshot) = prepared.update_snapshot.as_ref()?;
+            render_material_bindings.commit_uniform_update(material_id, binding, snapshot, &mut prepared.data, bind_group_allocators)
+                .then_some(binding)
+        });
+        let binding = if let Some(binding) = reused_binding { binding } else { render_material_bindings.prepare_material(
             &material,
             material_id,
             material_param,
-            &material_layout,
+            cpu_preparation.as_ref().map_or(&[], |prepared| prepared.data.as_slice()),
+            material_layout,
             bind_group_allocators,
             render_device,
             pipeline_cache,
             fallback_buffer,
             shader_buffer_assets,
-        )?;
+        )? };
+        if reused_binding.is_none() {
+            if let Some(prepared) = cpu_preparation.as_mut() {
+                prepared.update_snapshot = render_material_bindings.uniform_update_snapshot(material_id, bind_group_allocators);
+            }
+        }
 
+        let properties = if let Some(properties) = cpu_properties {
+            properties
+        } else { material_prepare_properties(|| {
         let shadows_enabled = M::enable_shadows();
         let prepass_enabled = M::enable_prepass();
 
@@ -1773,16 +2067,14 @@ where
         let bind_group_data = material.bind_group_data();
         let material_key = ErasedMaterialKey::new(bind_group_data);
 
-        Ok(PreparedMaterial {
-            binding,
-            properties: Arc::new(MaterialProperties {
+        Arc::new(MaterialProperties {
                 alpha_mode,
                 depth_bias: material.depth_bias(),
                 reads_view_transmission_texture,
                 render_phase_type,
                 render_method,
                 mesh_pipeline_key_bits,
-                material_layout: Some(material_layout),
+                material_layout: owner_layout,
                 draw_functions,
                 shaders,
                 bindless,
@@ -1793,8 +2085,10 @@ where
                 shadows_enabled,
                 prepass_enabled,
                 oit_enabled: M::enable_oit(),
-            }),
+            })
         })
+        };
+        Ok(material_prepare_return(binding, properties))
     }
 
     fn unload_asset(
