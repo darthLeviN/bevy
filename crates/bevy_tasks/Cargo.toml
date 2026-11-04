@@ -24,9 +24,9 @@ multi_threaded = [
 # library. Await init_web_thread_pools before running schedules on a regular page.
 wasm_threads = ["multi_threaded", "dep:wasm_thread"]
 
-# Uses `async-executor` as a task execution backend.
+# Uses the engine-owned async-executor adaptation on every target.
 # This backend is incompatible with `no_std` targets.
-async_executor = ["bevy_platform/std", "dep:async-executor", "futures-lite"]
+async_executor = ["bevy_platform/std", "async-task/std", "dep:concurrent-queue", "dep:fastrand", "dep:pin-project-lite", "dep:slab", "futures-lite"]
 
 # Provide an implementation of `block_on` from  `futures-lite`.
 futures-lite = ["bevy_platform/futures-lite"]
@@ -43,12 +43,15 @@ bevy_platform = { path = "../bevy_platform", version = "0.20.1", default-feature
 futures-lite = { version = "2.0.1", default-features = false, features = [
   "alloc",
 ] }
-async-task = { version = "4.4.0", default-features = false }
+async-task = { version = "4.7.1", default-features = false }
 derive_more = { version = "2", default-features = false, features = [
   "deref",
   "deref_mut",
 ] }
-async-executor = { version = "1.11", optional = true }
+# The engine-owned executor retains upstream's algorithms but uses platform locks.
+fastrand = { version = "2.0.0", optional = true }
+pin-project-lite = { version = "0.2", optional = true }
+slab = { version = "0.4.4", optional = true }
 async-channel = { version = "2.3.0", optional = true }
 concurrent-queue = { version = "2.0.0", optional = true }
 atomic-waker = { version = "1", default-features = false }
@@ -61,7 +64,7 @@ web-task = "1"
 wasm_thread = { version = "=0.3.3", optional = true }
 
 [target.'cfg(not(all(target_has_atomic = "8", target_has_atomic = "16", target_has_atomic = "32", target_has_atomic = "64", target_has_atomic = "ptr")))'.dependencies]
-async-task = { version = "4.4.0", default-features = false, features = [
+async-task = { version = "4.7.1", default-features = false, features = [
   "portable-atomic",
 ] }
 heapless = { version = "0.9", default-features = false, features = [

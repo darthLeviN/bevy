@@ -91,7 +91,9 @@ mod slice;
 mod usages;
 
 cfg::async_executor! {
-    if {} else {
+    if {
+        mod async_executor;
+    } else {
         mod edge_executor;
     }
 }
@@ -127,18 +129,23 @@ cfg::multi_threaded! {
     }
 }
 
+#[cfg(all(feature = "async_executor", any(test, all(target_arch = "wasm32", feature = "wasm_threads"))))]
+mod worker_block_on;
+#[cfg(all(feature = "async_executor", any(test, all(target_arch = "wasm32", feature = "wasm_threads"))))]
+mod pool_signal;
+
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
 pub use bevy_platform::future::block_on;
 
 /// Completes a synchronous CPU task scope without parking the browser main thread.
 ///
-/// Workers use the normal parking implementation. The browser main thread must
+/// Workers sleep with a page-safe notification waker. The browser main thread must
 /// poll instead: `memory.atomic.wait32` is forbidden there. This cannot drive
 /// browser I/O or worker startup; await those asynchronously before entering a scope.
 #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
 pub fn block_on<T>(future: impl Future<Output = T>) -> T {
     if is_web_worker_thread() {
-        return bevy_platform::future::block_on(future);
+        return worker_block_on::block_on(future);
     }
     let mut future = core::pin::pin!(future);
     let mut context = core::task::Context::from_waker(core::task::Waker::noop());

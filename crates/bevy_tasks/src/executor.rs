@@ -1,7 +1,7 @@
 //! Provides a fundamental executor primitive appropriate for the target platform
 //! and feature set selected.
-//! By default, the `async_executor` feature will be enabled, which will rely on
-//! [`async-executor`] for the underlying implementation. This requires `std`,
+//! By default, the `async_executor` feature will be enabled, which uses the
+//! engine-owned adaptation of [`async-executor`] on every target. This requires `std`,
 //! so is not suitable for `no_std` contexts. Instead, you must use `edge_executor`,
 //! which relies on the alternate [`edge-executor`] backend.
 //!
@@ -16,8 +16,9 @@ use derive_more::{Deref, DerefMut};
 
 crate::cfg::async_executor! {
     if {
-        type ExecutorInner<'a> = async_executor::Executor<'a>;
-        type LocalExecutorInner<'a> = async_executor::LocalExecutor<'a>;
+        use crate::async_executor as backend;
+        type ExecutorInner<'a> = backend::Executor<'a>;
+        type LocalExecutorInner<'a> = backend::LocalExecutor<'a>;
     } else {
         type ExecutorInner<'a> = crate::edge_executor::Executor<'a, 64>;
         type LocalExecutorInner<'a> = crate::edge_executor::LocalExecutor<'a, 64>;

@@ -1,0 +1,47 @@
+# Isolated native regression harness for the real bevy_tasks library sources.
+# Avoids resolving the engine's unrelated example/rendering workspace. Keep the
+# dependencies/features below aligned with crates/bevy_tasks/Cargo.toml.
+[package]
+name = "bevy_tasks_browser_tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "../../crates/bevy_tasks/src/lib.rs"
+doctest = false
+
+[features]
+default = ["async_executor", "multi_threaded", "futures-lite"]
+async_executor = ["bevy_platform/std", "async-task/std", "dep:concurrent-queue", "dep:fastrand", "dep:pin-project-lite", "dep:slab", "futures-lite", "bevy_tasks/async_executor"]
+multi_threaded = ["async_executor", "dep:async-channel", "bevy_tasks/multi_threaded"]
+futures-lite = ["bevy_platform/futures-lite", "bevy_tasks/futures-lite"]
+async-io = ["bevy_platform/async-io", "bevy_tasks/async-io"]
+wasm_threads = ["multi_threaded", "bevy_tasks/wasm_threads"]
+
+[dependencies]
+bevy_platform = { path = "../../crates/bevy_platform", default-features = false, features = ["alloc"] }
+async-task = { version = "4.7.1", default-features = false }
+async-channel = { version = "2.3.0", optional = true }
+concurrent-queue = { version = "2.0.0", optional = true }
+crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
+atomic-waker = { version = "1", default-features = false }
+derive_more = { version = "2", default-features = false, features = ["deref", "deref_mut"] }
+futures-lite = { version = "2.0.1", default-features = false, features = ["alloc"] }
+fastrand = { version = "2.0.0", optional = true }
+pin-project-lite = { version = "0.2", optional = true }
+slab = { version = "0.4.4", optional = true }
+
+[dev-dependencies]
+# Compiled as a real dependency (without cfg(test)) by native integration tests.
+bevy_tasks = { path = "../../crates/bevy_tasks", default-features = false }
+futures-lite = { version = "2.0.1", default-features = false, features = ["std"] }
+async-channel = "2.3.0"
+
+
+[[test]]
+name = "native_executor"
+path = "native_executor.rs"
+required-features = ["multi_threaded"]

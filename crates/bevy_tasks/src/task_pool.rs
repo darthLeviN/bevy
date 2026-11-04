@@ -11,6 +11,15 @@ use bevy_platform::sync::Arc;
 use concurrent_queue::ConcurrentQueue;
 use futures_lite::FutureExt;
 
+#[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
+use crate::pool_signal as pool_channel;
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm_threads")))]
+mod pool_channel {
+    pub(super) type Sender = async_channel::Sender<()>;
+    pub(super) type Receiver = async_channel::Receiver<()>;
+    pub(super) fn channel() -> (Sender, Receiver) { async_channel::unbounded() }
+}
+
 use crate::{
     block_on,
     thread_executor::{ThreadExecutor, ThreadExecutorTicker},
@@ -139,9 +148,9 @@ pub struct TaskPool {
 
     // The inner state of the pool.
     threads: Vec<JoinHandle<()>>,
-    shutdown_tx: async_channel::Sender<()>,
+    shutdown_tx: pool_channel::Sender,
     #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
-    worker_ready: async_channel::Receiver<()>,
+    worker_ready: pool_channel::Receiver,
 }
 
 impl TaskPool {
@@ -161,9 +170,9 @@ impl TaskPool {
     }
 
     fn new_internal(builder: TaskPoolBuilder) -> Self {
-        let (shutdown_tx, shutdown_rx) = async_channel::unbounded::<()>();
+        let (shutdown_tx, shutdown_rx) = pool_channel::channel();
         #[cfg(all(target_arch = "wasm32", feature = "wasm_threads"))]
-        let (ready_tx, worker_ready) = async_channel::unbounded::<()>();
+        let (ready_tx, worker_ready) = pool_channel::channel();
 
         let executor = Arc::new(crate::executor::Executor::new());
 
@@ -805,6 +814,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::Barrier;
 
