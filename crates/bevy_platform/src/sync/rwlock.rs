@@ -2,8 +2,12 @@
 
 pub use implementation::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(all(feature = "web", target_arch = "wasm32", target_feature = "atomics"))))]
 use std::sync as implementation;
+
+#[cfg(all(feature = "std", feature = "web", target_arch = "wasm32", target_feature = "atomics"))]
+#[path = "web_rwlock.rs"]
+mod implementation;
 
 #[cfg(not(feature = "std"))]
 mod implementation {

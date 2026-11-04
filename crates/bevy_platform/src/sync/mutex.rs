@@ -2,8 +2,16 @@
 
 pub use implementation::{Mutex, MutexGuard};
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(all(feature = "web", target_arch = "wasm32", target_feature = "atomics"))))]
 use std::sync as implementation;
+
+#[cfg(all(feature = "std", feature = "web", target_arch = "wasm32", target_feature = "atomics"))]
+#[path = "web_mutex.rs"]
+mod implementation;
+
+#[cfg(all(test, feature = "std", not(target_arch = "wasm32")))]
+#[path = "web_mutex.rs"]
+mod web_mutex_tests;
 
 #[cfg(not(feature = "std"))]
 mod implementation {
