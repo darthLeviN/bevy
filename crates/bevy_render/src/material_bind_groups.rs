@@ -26,6 +26,7 @@ use std::any::TypeId;
 use tracing::{error, trace};
 
 use crate::{
+    diagnostic::MaterialPreparation,
     erased_render_asset::PrepareAssetError,
     render_asset::RenderAssets,
     render_resource::{
@@ -2454,7 +2455,7 @@ impl MaterialBindGroupNonBindlessAllocator {
     }
 
     fn write_buffers(&mut self, queue: &RenderQueue) {
-        material_prepare_retained_uniform_write(|| {
+        MaterialPreparation::retained_uniform_write(|| {
         for group in self.dirty_uniforms.drain() {
             let Some(MaterialNonBindlessAllocatedBindGroup::Prepared {
                 bind_group, uniform_buffers, ..
@@ -2470,7 +2471,7 @@ impl MaterialBindGroupNonBindlessAllocator {
             }
         }
         });
-        material_prepare_page_upload(|| self.uniform_pages.upload(|buffer, offset, bytes| queue.write_buffer(buffer, offset, bytes)));
+        MaterialPreparation::page_upload(|| self.uniform_pages.upload(|buffer, offset, bytes| queue.write_buffer(buffer, offset, bytes)));
     }
 
     /// Inserts a bind group, either unprepared or prepared, into this allocator
@@ -2970,10 +2971,10 @@ impl RenderMaterialBindings {
     where
         M: AsBindGroup + Asset + Clone,
     {
-        let actual_material_layout = material_prepare_get_layout(|| pipeline_cache.get_bind_group_layout(material_layout));
+        let actual_material_layout = MaterialPreparation::resolve_layout(|| pipeline_cache.get_bind_group_layout(material_layout));
 
         // Ask the material to build the bind group.
-        let result = match material_prepare_build_bindings(|| material.build_bind_group_with_prepared_data(
+        let result = match MaterialPreparation::build_bindings(|| material.build_bind_group_with_prepared_data(
             &actual_material_layout,
             render_device,
             material_param,
@@ -2985,8 +2986,8 @@ impl RenderMaterialBindings {
                 let bind_group_allocator =
                     bind_group_allocators.get_mut(&TypeId::of::<M>()).unwrap();
                 // Allocate or update the material.
-                match material_prepare_lookup_binding(|| self.bindings.entry(material_id.into())) {
-                    Entry::Occupied(mut occupied_entry) => material_prepare_validate_update(|| {
+                match MaterialPreparation::lookup_binding(|| self.bindings.entry(material_id.into())) {
+                    Entry::Occupied(mut occupied_entry) => MaterialPreparation::validate_update(|| {
                         // First, try a fast path. If none of the GPU resource
                         // bindings have changed, then we can just update the
                         // POD and don't have to update any of the bindings in
@@ -2999,7 +3000,7 @@ impl RenderMaterialBindings {
                         } else {
                             // Otherwise, fall back to the slow path. Deallocate
                             // the GPU resource bindings, and reallocate them.
-                            let new_binding = material_prepare_replace_allocation(|| {
+                            let new_binding = MaterialPreparation::replace_allocation(|| {
                                 bind_group_allocator.free(old_binding);
                                 bind_group_allocator.allocate_unprepared(&mut self.bind_group_builder, material_layout)
                             });
@@ -3007,7 +3008,7 @@ impl RenderMaterialBindings {
                             Ok(new_binding)
                         }
                     }),
-                    Entry::Vacant(vacant_entry) => material_prepare_new_allocation(|| Ok(*vacant_entry.insert(
+                    Entry::Vacant(vacant_entry) => MaterialPreparation::new_allocation(|| Ok(*vacant_entry.insert(
                         bind_group_allocator
                             .allocate_unprepared(&mut self.bind_group_builder, material_layout),
                     ))),
@@ -3045,8 +3046,8 @@ impl RenderMaterialBindings {
 
         // Clear out the bind group builder (but retain its heap allocations; we
         // don't want to allocate here).
-        material_prepare_builder_clear(|| self.bind_group_builder.clear());
-        material_prepare_drop_layout(|| drop(actual_material_layout));
+        MaterialPreparation::clear_builder(|| self.bind_group_builder.clear());
+        MaterialPreparation::drop_layout(|| drop(actual_material_layout));
 
         result
     }
@@ -3066,35 +3067,6 @@ impl RenderMaterialBindings {
     }
 }
 
-// Sampling boundaries only: no clocks, tracing, allocation, or per-call recording.
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_lookup_binding<T>(lookup: impl FnOnce() -> T) -> T { lookup() }
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_new_allocation<T>(allocate: impl FnOnce() -> T) -> T { allocate() }
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_replace_allocation<T>(replace: impl FnOnce() -> T) -> T { replace() }
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_drop_layout(drop_layout: impl FnOnce()) { drop_layout() }
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_get_layout<T>(get: impl FnOnce() -> T) -> T { get() }
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_build_bindings<T>(build: impl FnOnce() -> T) -> T { build() }
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_validate_update<T>(update: impl FnOnce() -> T) -> T { update() }
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_builder_clear(clear: impl FnOnce()) { clear() }
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_retained_uniform_write(write: impl FnOnce()) { write() }
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_page_upload(upload: impl FnOnce()) { upload() }
 
 #[cfg(test)]
 mod tests {

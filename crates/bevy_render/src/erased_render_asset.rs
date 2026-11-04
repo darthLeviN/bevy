@@ -1,5 +1,5 @@
 use crate::{
-    render_resource::AsBindGroupError, ExtractSchedule, MainWorld, Render, RenderApp,
+    diagnostic::MaterialPreparation, render_resource::AsBindGroupError, ExtractSchedule, MainWorld, Render, RenderApp,
     RenderStartup, RenderSystems, Res,
 };
 use bevy_app::{App, Plugin, SubApp};
@@ -374,11 +374,6 @@ impl<A: ErasedRenderAsset> Default for PrepareNextFrameAssets<A> {
     }
 }
 
-// Preserve removal-before-preparation semantics while exposing its destructor CPU.
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn drop_previous_prepared_asset<T>(remove: impl FnOnce() -> T) {
-    drop(remove());
-}
 
 /// This system prepares all assets of the corresponding [`ErasedRenderAsset::SourceAsset`] type
 /// which where extracted this frame for the GPU.
@@ -447,7 +442,7 @@ pub fn prepare_erased_assets<A: ErasedRenderAsset>(
         // we remove previous here to ensure that if we are updating the asset then
         // any users will not see the old asset after a new asset is extracted,
         // even if the new asset is not yet ready or we are out of bytes to write.
-        drop_previous_prepared_asset(|| render_assets.remove(id));
+        MaterialPreparation::drop_previous(|| render_assets.remove(id));
 
         let write_bytes = if let Some(size) = A::byte_len(&extracted_asset) {
             if bpf.exhausted() {

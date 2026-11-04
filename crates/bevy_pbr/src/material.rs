@@ -37,6 +37,7 @@ use bevy_reflect::std_traits::ReflectDefault;
 use bevy_reflect::Reflect;
 use bevy_render::batching::gpu_preprocessing::BatchedInstanceBuffers;
 use bevy_render::camera::{DirtySpecializationSystems, DirtySpecializations, PendingQueues};
+use bevy_render::diagnostic::MaterialPreparation;
 use bevy_render::erased_render_asset::{
     ErasedRenderAsset, ErasedRenderAssetPlugin, ErasedRenderAssets, PrepareAssetError,
 };
@@ -1631,25 +1632,7 @@ where
     )
 }
 
-// Keep the metadata rebuild visible in sampled Wasm CPU stacks, without timers.
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_properties<T>(build: impl FnOnce() -> T) -> T {
-    build()
-}
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_copy_layout<T>(copy: impl FnOnce() -> T) -> T { copy() }
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_return(binding: MaterialBindingId, properties: Arc<MaterialProperties>) -> PreparedMaterial {
-    PreparedMaterial { binding, properties }
-}
-
-// orphan rules T_T
 /// A CPU-only preparation closure. It must not capture GPU resources or ECS parameters.
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn material_prepare_cpu_validate<T>(validate: impl FnOnce() -> T) -> T { validate() }
-
 pub type MaterialCpuJob<'a> = Box<dyn FnOnce(Vec<(u32, Vec<u8>)>) -> Vec<(u32, Vec<u8>)> + Send + 'a>;
 
 /// CPU-only results retained until the owner commits this material's bindings.
@@ -1750,7 +1733,7 @@ where M::Data: PartialEq + Eq + Hash + Clone {
             method => method,
         },
         mesh_pipeline_key_bits: ErasedMeshPipelineKey::new(MeshPipelineKey::empty()),
-        material_layout: material_prepare_copy_layout(|| template.material_layout.clone()),
+        material_layout: MaterialPreparation::copy_layout(|| template.material_layout.clone()),
         draw_functions: template.draw_functions.clone(),
         shaders: template.shaders.clone(),
         bindless: template.bindless,
@@ -1885,7 +1868,7 @@ where
                     None => (Vec::new(), None, None),
                 };
                 let data = job.take().unwrap()(data);
-                let properties = material_prepare_properties(|| {
+                let properties = MaterialPreparation::properties(|| {
                     if let Some(properties) = properties {
                         if material_properties_match(*material, &template, &properties) { return properties; }
                     }
@@ -1894,7 +1877,7 @@ where
                 // Only CPU IDs, descriptors, lengths and bytes are examined here.
                 // A hot-reloaded image changes the resolved resource ID even if its
                 // source handle is unchanged, forcing owner-side binding rebuilding.
-                let uniform_binding = material_prepare_cpu_validate(|| {
+                let uniform_binding = MaterialPreparation::validate_cpu(|| {
                     let (binding, snapshot) = update_snapshot.as_ref()?;
                     snapshot.matches(properties.material_layout.as_ref()?, resources.as_deref()?, &data)
                         .then_some(*binding)
@@ -1954,7 +1937,7 @@ where
         ): &mut SystemParamItem<Self::Param>,
     ) -> Result<Self::ErasedAsset, PrepareAssetError<Self::SourceAsset>> {
         let mut cpu_preparation = cpu_preparations.get_mut(&material_id);
-        let owner_layout = cpu_preparation.is_none().then(|| material_prepare_copy_layout(|| bind_group_allocators
+        let owner_layout = cpu_preparation.is_none().then(|| MaterialPreparation::copy_layout(|| bind_group_allocators
             .get(&TypeId::of::<M>())
             .unwrap()
             .bind_group_layout()
@@ -1989,7 +1972,7 @@ where
 
         let properties = if let Some(properties) = cpu_properties {
             properties
-        } else { material_prepare_properties(|| {
+        } else { MaterialPreparation::properties(|| {
         let shadows_enabled = M::enable_shadows();
         let prepass_enabled = M::enable_prepass();
 
@@ -2088,7 +2071,7 @@ where
             })
         })
         };
-        Ok(material_prepare_return(binding, properties))
+        Ok(MaterialPreparation::return_material(|| PreparedMaterial { binding, properties }))
     }
 
     fn unload_asset(

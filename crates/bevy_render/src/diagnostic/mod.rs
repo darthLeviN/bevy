@@ -3,6 +3,7 @@
 //! For more info, see [`RenderDiagnosticsPlugin`].
 
 mod erased_render_asset_diagnostic_plugin;
+mod material_preparation;
 pub(crate) mod internal;
 mod mesh_allocator_diagnostic_plugin;
 mod render_asset_diagnostic_plugin;
@@ -28,6 +29,7 @@ use crate::{
 use self::internal::{sync_diagnostics, Pass, RenderDiagnosticsMutex, WriteTimestamp};
 pub use self::{
     erased_render_asset_diagnostic_plugin::ErasedRenderAssetDiagnosticPlugin,
+    material_preparation::MaterialPreparation,
     internal::{DiagnosticsRecorder, GpuFrameTiming}, mesh_allocator_diagnostic_plugin::MeshAllocatorDiagnosticPlugin,
     render_asset_diagnostic_plugin::RenderAssetDiagnosticPlugin,
 };
