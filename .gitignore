@@ -7,9 +7,6 @@ crates/**/target
 benches/**/target
 tools/**/target
 
-# Standalone browser-threading experiments: keep source/config/locks, not bindings.
-tools/wasm-ecs-bench/pkg/
-tools/wasm-render-bench/pkg/
 
 **/*.rs.bk
 rustc-ice-*.txt
@@ -20,8 +17,7 @@ dxil.dll
 
 # Cargo
 Cargo.lock
-!tools/wasm-ecs-bench/Cargo.lock
-!tools/wasm-render-bench/Cargo.lock
+
 .cargo/config
 .cargo/config.toml
 
